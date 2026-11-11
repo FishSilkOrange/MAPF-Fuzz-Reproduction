@@ -1,0 +1,12 @@
+name: mapf-fuzz
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  # PIBT2 vendors a GoogleTest release which is not CMake 4 compatible.
+  - cmake>=3.16,<4
+  - make
+  - git
+  - gh
+

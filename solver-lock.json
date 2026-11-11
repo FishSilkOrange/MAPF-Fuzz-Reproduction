@@ -1,0 +1,21 @@
+{
+  "artifact_reference": {
+    "repository": "https://github.com/shepera/MAPF-Fuzz.git",
+    "commit": "90e65c4235f253381c325fc2772dc284efccc290"
+  },
+  "solvers": {
+    "pibt2": {
+      "repository": "https://github.com/Kei18/pibt2.git",
+      "commit": "faab5b916649549f1cd563df8dbf6e4f6382f631",
+      "provides": ["PIBT", "HCA", "PIBT_PLUS"],
+      "selection_basis": "Official source branch revision available before the MAPF-Fuzz artifact release; validate against the bundled defect corpus."
+    },
+    "lacam3": {
+      "repository": "https://github.com/Kei18/lacam3.git",
+      "commit": "1a269b7addc1edc4f1f56b194d307190f5491943",
+      "provides": ["LACAM3"],
+      "selection_basis": "Latest official source-branch revision before the MAPF-Fuzz artifact release; validate against the bundled defect corpus."
+    }
+  }
+}
+
