@@ -1,32 +1,16 @@
-# Local Python/Conda environments
+# Local environments and editor files
 .conda/
 .miniforge3/
 .venv/
-__pycache__/
-*.py[cod]
-
-# Native build products inside solver submodules
-code/third_party/*/build/
-
-# MAPF-Fuzz runtime artifacts
-code/log/
-code/logs/
-code/results/
-code/fail_task/
-code/failures/
-code/fuzz_index.ann
-code/fuzz_index_scaler.pkl
-code/fuzz_index_vectors.pkl
-*.pkl
-
-# Temporary solver inputs generated during fuzzing
-code/third_party/pibt2/map/tmp*.map
-code/third_party/pibt2/instances/mapf/tmp*.txt
-code/third_party/lacam3/assets/tmp*.map
-code/third_party/lacam3/assets/tmp*.scen
-
-# Editor and OS files
 .idea/
 .vscode/
 .DS_Store
+__pycache__/
+*.py[cod]
 
+# Native solver builds and temporary MAPF inputs
+solvers/*/build/
+solvers/pibt2/map/repro_*.map
+
+# Generated experiment data
+reproduce/output/
