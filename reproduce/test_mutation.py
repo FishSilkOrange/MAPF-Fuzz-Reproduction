@@ -55,6 +55,14 @@ class MutationChecks(unittest.TestCase):
         ann.add((10.0, 10.0))
         self.assertEqual(ann.indexed_count, 2)
         self.assertEqual(ann.query((10.0, 10.0))[0], 0.0)
+        with patch.dict(sys.modules, {"annoy": types.SimpleNamespace(AnnoyIndex=FakeAnnoyIndex)}):
+            restored = AnnoyNoveltyIndex(dimensions=2, seed=7, n_trees=3,
+                                         min_rebuild=2, max_rebuild=2)
+        for vector in ann.vectors:
+            restored.add(vector)
+        restored.restore_indexed_prefix(ann.indexed_count)
+        self.assertEqual(restored.indexed_count, 2)
+        self.assertEqual(restored.query((10.0, 10.0)), ann.query((10.0, 10.0)))
         ann.add((20.0, 20.0))
         self.assertEqual(ann.indexed_count, 4)
         self.assertEqual(ann.query((20.0, 20.0))[0], 0.0)

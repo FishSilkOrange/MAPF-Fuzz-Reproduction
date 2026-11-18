@@ -36,12 +36,14 @@ def build_plan(args: argparse.Namespace) -> dict:
                          "cases": cases, "time_limit": duration,
                          "maximum_initial_cases": min(cases, maximum_initial_cases),
                          "output": str(output)})
-    return {"profile": "server_main_experiment", "run_id_utc": run_id,
+    return {"profile": getattr(args, "profile", "server_main_experiment"),
+            "run_id_utc": run_id,
             "output_root": str(run_root), "map_dir": str(args.map_dir.resolve()),
             "maps": [str(path.resolve()) for path in map_files],
             "initial_map_sampling": "up_to_three_per_map_seed_42",
             "case_file_retention": "failures_and_every_500th_normal_case",
             "novelty_search": "annoy",
+            "checkpoint": "sqlite_after_each_dispatch_and_result",
             "size": 128, "agents": 100, "workers": args.workers,
             "init_cases": args.init_cases, "repeats": args.repeats,
             "timeout_seconds_per_call": args.timeout,
@@ -51,6 +53,8 @@ def build_plan(args: argparse.Namespace) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=("server_main_experiment", "rq3_efficiency"),
+                        default="server_main_experiment")
     parser.add_argument("--solver", choices=("all", *SOLVERS), default="all")
     parser.add_argument("--map-dir", type=Path, default=MAPS)
     parser.add_argument("--repeats", type=int, default=5)
@@ -64,6 +68,8 @@ def main() -> int:
                         help="wall-clock limit per solver call, from author settings")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--output-root", type=Path, default=SERVER_OUTPUT)
+    parser.add_argument("--resume-run", type=Path,
+                        help="continue the exact server_manifest.json plan in this run directory")
     parser.add_argument("--execute", action="store_true",
                         help="launch the planned jobs; omitted means print plan only")
     args = parser.parse_args()
@@ -71,11 +77,23 @@ def main() -> int:
             or args.timeout <= 0 or (args.cases is not None and args.cases < 1)
             or (args.time_limit is not None and args.time_limit <= 0)):
         parser.error("repeats, workers, init-cases, cases, time-limit and timeout must be positive")
-    if not args.map_dir.is_dir() or not list(args.map_dir.glob("*.map")):
+    if args.resume_run is None and (not args.map_dir.is_dir()
+                                    or not list(args.map_dir.glob("*.map"))):
         parser.error(f"map directory has no .map files: {args.map_dir}")
     if not CORE.is_file():
         parser.error(f"shared experiment runner does not exist: {CORE}")
-    plan = build_plan(args)
+    if args.resume_run is None:
+        plan = build_plan(args)
+    else:
+        run_manifest = args.resume_run.resolve() / "server_manifest.json"
+        if not run_manifest.is_file():
+            parser.error(f"server manifest does not exist: {run_manifest}")
+        plan = json.loads(run_manifest.read_text())
+        if (plan.get("profile") != args.profile
+                or Path(plan.get("output_root", "")).resolve() != args.resume_run.resolve()):
+            parser.error("resume-run does not match the saved server plan")
+        if not Path(plan["map_dir"]).is_dir():
+            parser.error(f"saved map directory does not exist: {plan['map_dir']}")
     if not args.execute:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return 0
@@ -84,17 +102,24 @@ def main() -> int:
     except (ImportError, OSError, AttributeError):
         parser.error("server ANN mode needs Annoy: python3 -m pip install -r reproduce/requirements-server.txt")
     run_root = Path(plan["output_root"])
-    run_root.mkdir(parents=True, exist_ok=False)
-    (run_root / "server_manifest.json").write_text(
-        json.dumps(plan, ensure_ascii=False, indent=2) + "\n")
+    if args.resume_run is None:
+        run_root.mkdir(parents=True, exist_ok=False)
+        (run_root / "server_manifest.json").write_text(
+            json.dumps(plan, ensure_ascii=False, indent=2) + "\n")
     for job in plan["jobs"]:
+        output = Path(job["output"])
+        checkpoint = output / "checkpoint.sqlite3"
+        if args.resume_run is not None and output.exists() and not checkpoint.is_file():
+            if not output.is_dir() or any(
+                    path.name != "checkpoint.lock" for path in output.iterdir()):
+                parser.error(f"cannot resume job with data but no checkpoint: {output}")
         command = [sys.executable, str(CORE),
                    "--solver", job["solver"],
                    "--map-dir", plan["map_dir"],
                    "--size", "128", "--agents", "100",
                    "--cases", str(job["cases"]),
-                   "--workers", str(args.workers),
-                   "--init-cases", str(args.init_cases),
+                   "--workers", str(plan["workers"]),
+                   "--init-cases", str(plan["init_cases"]),
                    "--init-policy", "per_map_three",
                    "--case-retention", "failures_samples",
                    "--normal-sample-every", "500",
@@ -102,9 +127,10 @@ def main() -> int:
                    "--time-limit", str(job["time_limit"]),
                    "--seed", str(job["seed"]),
                    "--mode", "mutate", "--patch-size", "32",
-                   "--threshold", "0.25", "--timeout", str(args.timeout),
+                   "--threshold", "0.25", "--timeout", str(plan["timeout_seconds_per_call"]),
                    "--lacam-time", "3", "--max-timestep", "30000",
                    "--output", job["output"]]
+        command.append("--resume" if checkpoint.is_file() else "--checkpoint")
         print(f"Server job: {job['solver']} repeat {job['repeat']}; output={job['output']}",
               flush=True)
         completed = subprocess.run(command, cwd=ROOT, check=False)

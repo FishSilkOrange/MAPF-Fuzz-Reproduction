@@ -40,7 +40,24 @@ python3 reproduce/run_server.py --solver all
 
 服务器保留每组的 `results.jsonl` 统计行和 `manifest.json`；CF、OF、执行异常案例，以及编号每 500 组抽到的一组正常案例，其已写出的地图、输入与求解器结果文件会保留。整组均未解的案例目前不算已证实的 CF/OF，也不会被保留。没有被选中保留的任务目录会在该组统计行写入后删除。`case_files_selected_for_retention` 表示保留策略是否选中该组；如果 worker 在写输入前就出错，目录仍可能不存在。本机入口仍保留全部已写出的文件。
 
-服务器小批量检查可用 `--solver pibt --repeats 1 --workers 2 --init-cases 2 --cases 4 --time-limit 60 --execute`。`--execute` 会实际运行；省略时只显示计划。当前没有断点续跑，Annoy 的服务器规模性能尚需实测，**正式长跑暂不可视为就绪**。
+服务器小批量检查可用 `--solver pibt --repeats 1 --workers 2 --init-cases 2 --cases 4 --time-limit 60 --execute`。`--execute` 会实际运行；省略时只显示计划。服务器每次派发和结算任务组都写入 `checkpoint.sqlite3`；中断后对同一时间戳目录执行：
+
+```bash
+python3 reproduce/run_server.py \
+  --resume-run reproduce/output/server/<原时间戳目录> --execute
+```
+
+恢复入口读取原 `server_manifest.json`，让每个已有检查点的批次由核心入口核验并快速返回或继续运行；未开始的批次按原参数启动。已完成任务组的种子池、随机状态、特征索引数据和统计会恢复；若工作进程已写出完整 `payload.json`，该组不会重跑求解器。中断时仍在运行、尚未写出完整缓存的少数任务组需要重试。同一任务目录有运行锁；若旧 worker 尚未退出，恢复会报错，稍后重试即可。停机时间不计入 1h/6h 的 fuzzing 时限；运行时约每 5 秒更新已用时，强制中断仍可能有少量计时误差。检查点只应在可信的原运行目录加载；恢复时会核对求解器参数以及代码、地图和求解器二进制的 SHA-256，防止混用不同配置。真实 Annoy 的服务器规模性能尚需实测，**正式长跑暂不可视为就绪**。
+
+RQ3 使用独立入口和输出目录，按论文在初始化后每个求解器单进程运行 1 小时；仍使用 128×128 地图、100 agents 和 Annoy。默认 `--cases 1000000` 只是防止异常无限循环，正常由时间上限停止。省略 `--execute` 可先查看计划：
+
+```bash
+python3 reproduce/run_rq3.py --solver all --execute
+python3 reproduce/run_rq3.py \
+  --resume-run reproduce/output/rq3/<原时间戳目录> --execute
+```
+
+每条 `results.jsonl` 增加 `completed_at_utc`、`fuzz_elapsed_seconds`、`phase_seconds` 和 `timing_complete`；`summary.json` 另记该批次最终 `fuzz_elapsed_seconds`。前两项记录 worker 完成计算的时刻；若 worker 已缓存结果但主进程在入库前中断，恢复时仍沿用缓存中的原时刻。初始池任务的 `fuzz_elapsed_seconds` 为 `null`；其余任务从初始池完成时起计，恢复时不计停机时间。`phase_seconds` 的 `mutation` 包含主进程选种与生成任务；`metamorphic` 包含轨迹热点与 MR 变换；`solver` 只计目标求解器子进程；`result_analysis` 包含轨迹解析验证、特征与评分；`other` 包含 worker 的输入输出准备和结果包装。`worker_elapsed_seconds` 是 worker 写检查点缓存前的总时长。单进程 RQ3 汇总时应排除初始池任务；将检查点写入、调度及其余未归类时间作为残余开销单列。由于本复现启用 SQLite 检查点，含检查点的端到端非求解器占比不能直接与论文图 6 的框架占比等同。并行主实验的各 worker 秒数不能相加当作墙钟时间。求解器异常导致计时缺失时，`timing_complete` 为 `false`。
 
 ## 当前实现
 

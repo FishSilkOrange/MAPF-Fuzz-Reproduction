@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import hashlib
 import heapq
 import json
 import math
@@ -19,7 +20,9 @@ import shutil
 import subprocess
 import tempfile
 import time
-from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+from datetime import datetime, timezone
+from concurrent.futures import (Future, ProcessPoolExecutor,
+                                TimeoutError as FuturesTimeoutError, as_completed)
 from concurrent.futures.process import BrokenProcessPool
 from collections import Counter, deque
 from contextlib import nullcontext
@@ -324,6 +327,17 @@ class AnnoyNoveltyIndex:
         index.build(self.n_trees, n_jobs=1)
         self.index = index
         self.indexed_count = count
+
+    def restore_indexed_prefix(self, count: int) -> None:
+        """Rebuild only the last committed tree; retain newer vectors in buffer."""
+        if not 0 <= count <= len(self.vectors):
+            raise ValueError("Invalid Annoy indexed vector count in checkpoint")
+        all_vectors = self.vectors
+        try:
+            self.vectors = all_vectors[:count]
+            self.build_initial()
+        finally:
+            self.vectors = all_vectors
 
     def query(self, features: tuple[float, ...]) -> tuple[float, float | None] | None:
         if len(features) != self.dimensions:
@@ -997,9 +1011,16 @@ def execute(task: Task, solver: str, run_dir: Path, label: str,
                 command = [str(executable), "-i", str(input_path), "-s", solver.upper(),
                            "-o", str(result_path), "-v"]
             begin = time.monotonic()
+            solver_seconds = 0.0
+            result_analysis_seconds = 0.0
             try:
-                proc = subprocess.run(command, cwd=solver_root, capture_output=True,
-                                      text=True, timeout=timeout, check=False)
+                solver_start = time.monotonic()
+                try:
+                    proc = subprocess.run(command, cwd=solver_root, capture_output=True,
+                                          text=True, timeout=timeout, check=False)
+                finally:
+                    solver_seconds = time.monotonic() - solver_start
+                analysis_start = time.monotonic()
                 if result_path.exists():
                     try:
                         status = parse_result(result_path, task)
@@ -1007,6 +1028,7 @@ def execute(task: Task, solver: str, run_dir: Path, label: str,
                         status = {"status": "parse_error", "error": str(exc)}
                 else:
                     status = {"status": "no_result"}
+                result_analysis_seconds = time.monotonic() - analysis_start
                 status["returncode"] = proc.returncode
                 if proc.returncode != 0:
                     status["status"] = "execution_error"
@@ -1014,6 +1036,10 @@ def execute(task: Task, solver: str, run_dir: Path, label: str,
             except subprocess.TimeoutExpired:
                 status = {"status": "timeout"}
             status["elapsed_seconds"] = round(time.monotonic() - begin, 3)
+            status["_phase_seconds"] = {
+                "solver": solver_seconds,
+                "result_analysis": result_analysis_seconds,
+            }
             return status
         finally:
             if solver != "lacam3":
@@ -1022,16 +1048,31 @@ def execute(task: Task, solver: str, run_dir: Path, label: str,
 
 def evaluate_case(task: Task, solver: str, case_dir: Path, seed: int,
                   max_timestep: int, timeout: float, lacam_time: float,
-                  cache_payload: bool = False) -> dict:
+                  cache_payload: bool = False,
+                  fuzz_start_monotonic: float | None = None) -> dict:
     """Run a whole MR group in one worker and return compact feedback."""
+    worker_start = time.monotonic()
+    phase_seconds = {"metamorphic": 0.0, "solver": 0.0,
+                     "result_analysis": 0.0}
+
+    def timed_execute(value: Task, label: str) -> dict:
+        result = execute(value, solver, case_dir, label,
+                         max_timestep, timeout, lacam_time)
+        timings = result.pop("_phase_seconds", {})
+        phase_seconds["solver"] += timings.get("solver", 0.0)
+        phase_seconds["result_analysis"] += timings.get("result_analysis", 0.0)
+        return result
+
     rng = random.Random(seed)
     variants = {"original": task}
-    results = {"original": execute(task, solver, case_dir, "original",
-                                    max_timestep, timeout, lacam_time)}
+    results = {"original": timed_execute(task, "original")}
+    metamorphic_start = time.monotonic()
     hot_scores = (trajectory_hot_scores(task, results["original"])
                   if results["original"]["status"] == "solved" else None)
+    phase_seconds["metamorphic"] += time.monotonic() - metamorphic_start
     for relation in ("swap_start_goal", "order", "left_right", "up_down",
                      "rotate_180", "add_probe", "add_obstacle"):
+        metamorphic_start = time.monotonic()
         if relation in ("add_probe", "add_obstacle"):
             if hot_scores is None:
                 continue
@@ -1039,11 +1080,13 @@ def evaluate_case(task: Task, solver: str, case_dir: Path, seed: int,
         else:
             value = transform(task, relation, rng)
         variants[relation] = value
-        results[relation] = execute(value, solver, case_dir, relation,
-                                    max_timestep, timeout, lacam_time)
+        phase_seconds["metamorphic"] += time.monotonic() - metamorphic_start
+        results[relation] = timed_execute(value, relation)
     original = results["original"]
+    analysis_start = time.monotonic()
     c_score = critical_score(task, original) if original["status"] == "solved" else 0.0
     feature = seed_features(task, original) if original["status"] == "solved" else None
+    phase_seconds["result_analysis"] += time.monotonic() - analysis_start
     probes_added = (len(variants["add_probe"].agents) - len(task.agents)
                     if "add_probe" in variants else None)
     obstacles_added = (sum(a == "." and b == "@"
@@ -1052,8 +1095,19 @@ def evaluate_case(task: Task, solver: str, case_dir: Path, seed: int,
                        if "add_obstacle" in variants else None)
     for result in results.values():
         result.pop("_frames", None)
+    worker_finished = time.monotonic()
+    worker_elapsed = worker_finished - worker_start
+    phase_seconds["other"] = max(
+        0.0, worker_elapsed - sum(phase_seconds.values()))
     payload = {"results": results, "critical_score": c_score, "feature": feature,
-               "probes_added": probes_added, "obstacles_added": obstacles_added}
+               "probes_added": probes_added, "obstacles_added": obstacles_added,
+               "phase_seconds": phase_seconds, "worker_elapsed_seconds": worker_elapsed,
+               "worker_completed_at_utc": (datetime.now(timezone.utc)
+                                           .isoformat(timespec="milliseconds")
+                                           .replace("+00:00", "Z")),
+               "worker_fuzz_elapsed_seconds": (
+                   worker_finished - fuzz_start_monotonic
+                   if fuzz_start_monotonic is not None else None)}
     if cache_payload:
         temporary = case_dir / "payload.json.tmp"
         with temporary.open("w") as stream:
@@ -1104,8 +1158,17 @@ def run(args: argparse.Namespace) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     if checkpoint_enabled and not resume_enabled and (out / "manifest.json").exists():
         raise FileExistsError(f"Output already has a run; choose another directory: {out}")
+    solver_binary = ((LACAM if args.solver == "lacam3" else PIBT) / "build" /
+                     ("main" if args.solver == "lacam3" else "mapf"))
+    source_files = (Path(__file__), Path(__file__).with_name("checkpoint.py"))
     manifest = {"solver": args.solver, "map": str(map_paths[0].resolve()) if len(maps) == 1 else None,
                 "maps": [path for path, _ in maps],
+                "map_sha256": {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
+                               for path in map_paths},
+                "source_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                                  for path in source_files},
+                "solver_sha256": (hashlib.sha256(solver_binary.read_bytes()).hexdigest()
+                                  if solver_binary.is_file() else None),
                 "size": args.size, "agents": args.agents, "seed": args.seed,
                 "cases": args.cases, "workers": workers,
                 "init_cases": init_cases, "init_cases_requested": requested_init_cases,
@@ -1113,6 +1176,9 @@ def run(args: argparse.Namespace) -> Path:
                 "case_retention": case_retention,
                 "novelty_search": novelty_search,
                 "checkpoint": checkpoint_enabled,
+                "timeout": args.timeout,
+                "lacam_time": args.lacam_time,
+                "max_timestep": args.max_timestep,
                 "normal_sample_every": normal_sample_every,
                 "threshold": args.threshold,
                 "mode": args.mode, "patch_size": args.patch_size,
@@ -1123,20 +1189,28 @@ def run(args: argparse.Namespace) -> Path:
                 "soc_relations": list(SOC_RELATIONS),
                 "solution_dependent_relations": ["add_probe", "add_obstacle"],
                 "probe_and_obstacle_target": 30}
-    journal = RunJournal(out, manifest, resume_enabled) if checkpoint_enabled else None
+    journal = (RunJournal(out, manifest, resume_enabled, rng.getstate())
+               if checkpoint_enabled else None)
     if journal is not None:
         if resume_enabled:
             journal.sync_outputs()
+            if journal.meta("final_status") in ("case_limit", "time_limit"):
+                summary = journal.meta("final_summary")
+                if summary is not None:
+                    temporary = out / "summary.json.tmp"
+                    temporary.write_text(json.dumps(summary, indent=2) + "\n")
+                    os.replace(temporary, out / "summary.json")
+                journal.close()
+                return out
             rng.setstate(journal.meta("rng_state"))
             for vector in journal.load_features():
                 novelty_index.add(vector)
             if journal.meta("phase_started"):
-                novelty_index.build_initial()
-            if journal.meta("final_status") in ("case_limit", "time_limit"):
-                journal.close()
-                return out
-        else:
-            journal.set_rng_state(rng.getstate())
+                if novelty_search == "annoy":
+                    novelty_index.restore_indexed_prefix(
+                        journal.meta("annoy_indexed_count", 0))
+                else:
+                    novelty_index.build_initial()
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     counts = (journal.meta("counts") if resume_enabled else
               {"completeness_failure": 0, "cost_gap": 0,
@@ -1274,27 +1348,41 @@ def run(args: argparse.Namespace) -> Path:
     completed = journal.completed_count() if resume_enabled else 0
     next_case = journal.meta("next_case") if resume_enabled else 0
     init_completed = journal.meta("init_completed") if resume_enabled else 0
-    fuzz_start = (time.monotonic() - journal.meta("fuzz_elapsed")
-                  if resume_enabled and journal.meta("phase_started") else None)
+    saved_pending = journal.load_pending() if resume_enabled else []
+    cached_pending_payloads = {}
+    for saved in saved_pending:
+        cached = out / f"case_{saved['case']:05d}" / "payload.json"
+        if cached.is_file():
+            cached_pending_payloads[saved["case"]] = json.loads(cached.read_text())
+    resume_elapsed = (journal.meta("fuzz_elapsed")
+                      if resume_enabled and journal.meta("phase_started") else None)
+    if resume_elapsed is not None:
+        for cached_payload in cached_pending_payloads.values():
+            cached_elapsed = cached_payload.get("worker_fuzz_elapsed_seconds")
+            if isinstance(cached_elapsed, (int, float)) and math.isfinite(cached_elapsed):
+                resume_elapsed = max(resume_elapsed, cached_elapsed)
+    fuzz_start = (time.monotonic() - resume_elapsed
+                  if resume_elapsed is not None else None)
     dispatch_error = None
     processing_error = None
     pool_context = (ProcessPoolExecutor(max_workers=workers,
                                         mp_context=multiprocessing.get_context("fork"))
                     if workers > 1 else nullcontext(None))
     with (out / "results.jsonl").open("a" if resume_enabled else "w") as stream, pool_context as executor:
-        pending: dict[Future, tuple[int, int | None, Task, str, str]] = {}
+        pending: dict[Future, tuple[int, int | None, Task, str, str, float]] = {}
+        recovering_pending = bool(saved_pending)
         if resume_enabled:
-            for saved in journal.load_pending():
+            for saved in saved_pending:
                 case = saved["case"]
                 task = saved["task"]
                 case_dir = out / f"case_{case:05d}"
-                cached = case_dir / "payload.json"
-                if cached.is_file():
+                if case in cached_pending_payloads:
                     future = Future()
-                    future.set_result(json.loads(cached.read_text()))
+                    future.set_result(cached_pending_payloads[case])
                 else:
                     arguments = (task, args.solver, case_dir, saved["case_seed"],
-                                 args.max_timestep, args.timeout, args.lacam_time, True)
+                                 args.max_timestep, args.timeout, args.lacam_time,
+                                 True, fuzz_start)
                     if executor is None:
                         future = Future()
                         try:
@@ -1302,26 +1390,36 @@ def run(args: argparse.Namespace) -> Path:
                         except BaseException as exc:
                             future.set_exception(exc)
                     else:
-                        future = executor.submit(evaluate_case, *arguments)
+                        try:
+                            future = executor.submit(evaluate_case, *arguments)
+                        except Exception as exc:
+                            dispatch_error = repr(exc)
+                            break
                 pending[future] = (case, saved["parent_case"], task,
-                                   saved["map_source"], saved["mutation"])
+                                   saved["map_source"], saved["mutation"],
+                                   saved["mutation_seconds"])
         while next_case < args.cases or pending:
+            if processing_error is not None or dispatch_error is not None:
+                break
             if init_completed == init_cases and fuzz_start is None:
                 try:
                     novelty_index.build_initial()
                     if journal is not None:
-                        journal.start_fuzzing()
+                        journal.start_fuzzing(
+                            novelty_index.indexed_count if novelty_search == "annoy" else 0)
                 except Exception as exc:
                     processing_error = f"initial novelty index build: {exc!r}"
                     break
                 fuzz_start = time.monotonic()
-            while len(pending) < workers and next_case < args.cases and dispatch_error is None:
+            while (len(pending) < workers and next_case < args.cases
+                   and dispatch_error is None and not recovering_pending):
                 if next_case >= init_cases and init_completed < init_cases:
                     break  # Complete initial pool before starting the timed fuzzing phase.
                 if (fuzz_start is not None and time_limit is not None
                         and time.monotonic() - fuzz_start >= time_limit):
                     break
                 case = next_case
+                mutation_start = time.monotonic()
                 parent_case = None
                 mutation = "random_initialization"
                 selected = None
@@ -1348,18 +1446,20 @@ def run(args: argparse.Namespace) -> Path:
                         task = generate_task(grid, args.agents, rng)
                 case_dir = out / f"case_{case:05d}"
                 case_seed = rng.randrange(2**63)
+                mutation_seconds = time.monotonic() - mutation_start
                 if journal is not None:
                     try:
                         journal.dispatch(case, parent_case, task, map_source,
                                          mutation, case_seed, rng.getstate(), selected,
                                          time.monotonic() - fuzz_start
-                                         if fuzz_start is not None else 0.0)
+                                         if fuzz_start is not None else 0.0,
+                                         mutation_seconds)
                     except Exception as exc:
                         processing_error = f"case {case} checkpoint dispatch: {exc!r}"
                         break
                 arguments = (task, args.solver, case_dir, case_seed,
                              args.max_timestep, args.timeout, args.lacam_time,
-                             journal is not None)
+                             journal is not None, fuzz_start)
                 if executor is None:
                     future = Future()
                     try:
@@ -1371,30 +1471,64 @@ def run(args: argparse.Namespace) -> Path:
                         future = executor.submit(evaluate_case, *arguments)
                     except Exception as exc:
                         dispatch_error = repr(exc)
-                        future = Future()
-                        future.set_exception(exc)
-                pending[future] = (case, parent_case, task, map_source, mutation)
+                        break  # The checkpointed case remains pending for resume.
+                pending[future] = (case, parent_case, task, map_source,
+                                   mutation, mutation_seconds)
                 next_case += 1
             if processing_error is not None:
                 break
             if not pending:
                 break
-            future = next(as_completed(pending))
-            case, parent_case, task, map_source, mutation = pending.pop(future)
+            try:
+                future = next(as_completed(pending, timeout=5))
+            except FuturesTimeoutError:
+                if journal is not None and fuzz_start is not None:
+                    try:
+                        journal.update_elapsed(time.monotonic() - fuzz_start)
+                    except Exception as exc:
+                        processing_error = f"checkpoint heartbeat: {exc!r}"
+                        break
+                continue
+            case, parent_case, task, map_source, mutation, mutation_seconds = pending.pop(future)
             try:
                 payload = future.result()
+            except BrokenProcessPool as exc:
+                dispatch_error = repr(exc)
+                break  # Keep all uncommitted cases in SQLite for the next run.
             except Exception as exc:
-                if isinstance(exc, BrokenProcessPool):
-                    dispatch_error = repr(exc)
                 # A failed case is recorded without losing other completed work.
                 payload = {"results": {"original": {
                     "status": "execution_error", "error": repr(exc)}},
                     "critical_score": 0.0, "feature": None,
                     "probes_added": None, "obstacles_added": None}
             try:
+                scoring_start = time.monotonic()
                 row, keep_files, feature, feature_eligible, pool_eligible, \
                     second_distance, feedback = process_complete(
                         case, parent_case, task, map_source, mutation, payload)
+                scoring_seconds = time.monotonic() - scoring_start
+                worker_phases = payload.get("phase_seconds") or {}
+                row["timing_complete"] = bool(worker_phases)
+                row["phase_seconds"] = {
+                    "mutation": round(mutation_seconds, 6),
+                    "metamorphic": round(worker_phases.get("metamorphic", 0.0), 6),
+                    "solver": round(worker_phases.get("solver", 0.0), 6),
+                    "result_analysis": round(
+                        worker_phases.get("result_analysis", 0.0) + scoring_seconds, 6),
+                    "other": round(worker_phases.get("other", 0.0), 6),
+                }
+                row["worker_elapsed_seconds"] = (
+                    round(payload["worker_elapsed_seconds"], 6)
+                    if "worker_elapsed_seconds" in payload else None)
+                worker_fuzz_elapsed = payload.get("worker_fuzz_elapsed_seconds")
+                row["fuzz_elapsed_seconds"] = (
+                    round(worker_fuzz_elapsed, 3)
+                    if worker_fuzz_elapsed is not None else
+                    round(time.monotonic() - fuzz_start, 3)
+                    if fuzz_start is not None else None)
+                row["completed_at_utc"] = payload.get("worker_completed_at_utc") or (
+                    datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"))
                 next_init_completed = init_completed + int(case < init_cases)
                 if journal is not None:
                     journal.complete(
@@ -1402,7 +1536,8 @@ def run(args: argparse.Namespace) -> Path:
                         feature_eligible, pool_eligible and args.mode == "mutate",
                         second_distance, counts, cf_count, of_count,
                         dict(mr_violations), next_init_completed,
-                        time.monotonic() - fuzz_start if fuzz_start is not None else 0.0)
+                        time.monotonic() - fuzz_start if fuzz_start is not None else 0.0,
+                        novelty_index.indexed_count if novelty_search == "annoy" else 0)
                     completed += 1
                 stream.write(json.dumps(row, ensure_ascii=False) + "\n")
                 stream.flush()
@@ -1417,21 +1552,34 @@ def run(args: argparse.Namespace) -> Path:
                 processing_error = f"case {case} processing: {exc!r}"
                 break
             init_completed = next_init_completed
+            if recovering_pending and not pending:
+                recovering_pending = False
+    if journal is not None and processing_error is not None:
+        # Scoring may have changed in-memory state before its transaction failed.
+        counts = journal.meta("counts")
+        cf_count = journal.meta("cf_count")
+        of_count = journal.meta("of_count")
+        completed = journal.completed_count()
     stop_reason = ("processing_error" if processing_error is not None else
                    "worker_pool_error" if dispatch_error is not None else
                    "time_limit" if completed < args.cases else "case_limit")
-    (out / "summary.json").write_text(json.dumps(
-        {"counts": counts, "cf_count": cf_count, "of_count": of_count,
-         "completed_cases": completed, "requested_cases": args.cases,
-         "stop_reason": stop_reason,
-         "dispatch_error": dispatch_error,
-         "processing_error": processing_error,
-         "manifest": manifest}, indent=2) + "\n")
+    final_fuzz_elapsed = (time.monotonic() - fuzz_start
+                          if fuzz_start is not None else None)
+    summary = {"counts": counts, "cf_count": cf_count, "of_count": of_count,
+               "completed_cases": completed, "requested_cases": args.cases,
+               "fuzz_elapsed_seconds": (round(final_fuzz_elapsed, 3)
+                                        if final_fuzz_elapsed is not None else None),
+               "stop_reason": stop_reason,
+               "dispatch_error": dispatch_error,
+               "processing_error": processing_error,
+               "manifest": manifest}
     if journal is not None:
         if stop_reason in ("case_limit", "time_limit"):
-            journal.finish(stop_reason, time.monotonic() - fuzz_start
-                           if fuzz_start is not None else 0.0)
+            journal.finish(stop_reason, final_fuzz_elapsed or 0.0, summary)
         journal.close()
+    temporary = out / "summary.json.tmp"
+    temporary.write_text(json.dumps(summary, indent=2) + "\n")
+    os.replace(temporary, out / "summary.json")
     if processing_error is not None:
         raise RuntimeError(f"Experiment stopped early: {processing_error}; see {out / 'summary.json'}")
     if dispatch_error is not None:
