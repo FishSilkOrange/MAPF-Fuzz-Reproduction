@@ -57,7 +57,9 @@ python3 reproduce/run_rq3.py \
   --resume-run reproduce/output/rq3/<原时间戳目录> --execute
 ```
 
-每条 `results.jsonl` 增加 `completed_at_utc`、`fuzz_elapsed_seconds`、`phase_seconds` 和 `timing_complete`；`summary.json` 另记该批次最终 `fuzz_elapsed_seconds`。前两项记录 worker 完成计算的时刻；若 worker 已缓存结果但主进程在入库前中断，恢复时仍沿用缓存中的原时刻。初始池任务的 `fuzz_elapsed_seconds` 为 `null`；其余任务从初始池完成时起计，恢复时不计停机时间。`phase_seconds` 的 `mutation` 包含主进程选种与生成任务；`metamorphic` 包含轨迹热点与 MR 变换；`solver` 只计目标求解器子进程；`result_analysis` 包含轨迹解析验证、特征与评分；`other` 包含 worker 的输入输出准备和结果包装。`worker_elapsed_seconds` 是 worker 写检查点缓存前的总时长。单进程 RQ3 汇总时应排除初始池任务；将检查点写入、调度及其余未归类时间作为残余开销单列。由于本复现启用 SQLite 检查点，含检查点的端到端非求解器占比不能直接与论文图 6 的框架占比等同。并行主实验的各 worker 秒数不能相加当作墙钟时间。求解器异常导致计时缺失时，`timing_complete` 为 `false`。
+每条 `results.jsonl` 含 `completed_at_utc`、`fuzz_elapsed_seconds`、`phase_seconds` 和 `timing_complete`；`summary.json` 记录最终 `fuzz_elapsed_seconds` 及单进程限时运行的 `rq3_timing`。初始池任务的 `fuzz_elapsed_seconds` 为 `null`；其余任务从初始池完成时起计，恢复时不计停机时间。`phase_seconds` 的四个互斥论文类别是：`mutation`（选种与变异）、`metamorphic`（轨迹热点与 MR 生成）、`execution`（求解器输入准备、求解器运行、结果解析与清理）、`result_analysis`（轨迹分析、特征、评分和新颖度）。诊断子项 `solver`（纯子进程）和 `result_parse` 已包含在 `execution` 内，不能再与它相加；额外保存可重放输入的 `artifact_io` 和 worker 剩余 `other` 另列。`worker_elapsed_seconds` 是 worker 写检查点缓存前的总时长。
+
+`rq3_timing.category_percent` 排除初始池和计时缺失的任务，以四个论文类别之和作为分母，便于与论文图 6 的四段占比对照；`seconds` 保留各类原始秒数及诊断子项。`wall_seconds` 和 `wall_unattributed_seconds` 另示实际单进程墙钟时间与未计入四类的时间，后者混合检查点写盘、调度等开销，**不是精确的检查点计时**。作者代码的 `exec_task` 也将输入准备与结果解析计入执行阶段，但本复现仍有实现与计时边界差异，所以图 6 对照应标为近似复现。并行主实验的各 worker 秒数不能相加当作墙钟时间。求解器异常导致计时缺失时，`timing_complete` 为 `false`。
 
 ## 当前实现
 

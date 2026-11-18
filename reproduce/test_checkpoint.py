@@ -18,6 +18,28 @@ from reproduce import run_pairs, run_rq3, run_server
 
 
 class CheckpointChecks(unittest.TestCase):
+    def test_rq3_percentages_exclude_initial_pool_and_nested_solver_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.jsonl"
+            rows = [
+                {"case": 0, "timing_complete": True,
+                 "phase_seconds": {"mutation": 99, "metamorphic": 99,
+                                   "execution": 99, "result_analysis": 99}},
+                {"case": 1, "timing_complete": True,
+                 "phase_seconds": {"mutation": 1, "metamorphic": 2,
+                                   "execution": 6, "solver": 5,
+                                   "result_parse": 0.5, "artifact_io": 0.25,
+                                   "result_analysis": 1, "other": 0.1}},
+                {"case": 2, "timing_complete": False, "phase_seconds": {}},
+            ]
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            timing = run_pairs.rq3_timing_summary(path, init_cases=1, wall_seconds=11)
+            self.assertEqual(timing["post_initialization_cases"], 1)
+            self.assertEqual(timing["excluded_incomplete_cases"], 1)
+            self.assertEqual(timing["categorized_seconds"], 10)
+            self.assertEqual(timing["category_percent"]["execution"], 60)
+            self.assertEqual(timing["wall_unattributed_seconds"], 0.75)
+
     def test_run_lock_blocks_concurrent_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -142,7 +164,7 @@ class CheckpointChecks(unittest.TestCase):
                                    novelty_search="exact", workers=1,
                                    init_policy="uniform", case_retention="all",
                                    normal_sample_every=500, init_cases=1,
-                                   time_limit=None, map_dir=None, map=map_file,
+                                   time_limit=60, map_dir=None, map=map_file,
                                    size=8, agents=2, cases=2, mode="baseline",
                                    patch_size=2, solver="pibt", timeout=2,
                                    lacam_time=3, max_timestep=1000,
@@ -154,7 +176,7 @@ class CheckpointChecks(unittest.TestCase):
                 time.sleep(0.001)
                 return {"status": "unsolved", "reported_soc": None,
                         "_phase_seconds": {"solver": 0.0005,
-                                           "result_analysis": 0.0001}}
+                                           "result_parse": 0.0001}}
 
             with patch.object(run_pairs, "execute", side_effect=fake_execute), \
                  redirect_stdout(io.StringIO()):
@@ -168,9 +190,18 @@ class CheckpointChecks(unittest.TestCase):
                 self.assertTrue(row["completed_at_utc"].endswith("Z"))
                 self.assertTrue(row["timing_complete"])
                 self.assertGreater(row["phase_seconds"]["solver"], 0)
+                self.assertGreaterEqual(row["phase_seconds"]["execution"],
+                                        row["phase_seconds"]["solver"] +
+                                        row["phase_seconds"]["result_parse"])
+                self.assertGreater(row["phase_seconds"]["result_parse"], 0)
                 self.assertGreater(row["phase_seconds"]["metamorphic"], 0)
                 self.assertGreater(row["phase_seconds"]["result_analysis"], 0)
                 self.assertNotIn("_phase_seconds", row["results"]["original"])
+            timing = json.loads((args.output / "summary.json").read_text())["rq3_timing"]
+            self.assertEqual(timing["post_initialization_cases"], 1)
+            self.assertEqual(timing["excluded_incomplete_cases"], 0)
+            self.assertAlmostEqual(sum(timing["category_percent"].values()),
+                                   100.0, delta=0.01)
             args.resume = True
             with patch.object(run_pairs, "execute", side_effect=AssertionError("reran case")):
                 run_pairs.run(args)

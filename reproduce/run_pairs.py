@@ -998,11 +998,14 @@ def execute(task: Task, solver: str, run_dir: Path, label: str,
             suffix = ".scen" if solver == "lacam3" else ".txt"
             input_path = Path(scratch) / f"input{suffix}"
             write_instance(task, solver, solver_map, input_path, max_timestep, int(timeout * 1000))
-            # Preserve every input needed to repeat a displayed finding.
+            # This extra copy is for our replay artifacts, not the author's
+            # exec_task timer. Keep it separate from comparable execution time.
+            artifact_start = time.monotonic()
             saved_map = case_dir / "input.map"
             (saved_map).write_bytes(solver_map.read_bytes())
             saved_input = case_dir / f"input{suffix}"
             write_instance(task, solver, saved_map, saved_input, max_timestep, int(timeout * 1000))
+            artifact_seconds = time.monotonic() - artifact_start
             if solver == "lacam3":
                 command = [str(executable), "-i", str(input_path), "-m", str(solver_map),
                            "-N", str(len(task.agents)), "-o", str(result_path),
@@ -1012,7 +1015,7 @@ def execute(task: Task, solver: str, run_dir: Path, label: str,
                            "-o", str(result_path), "-v"]
             begin = time.monotonic()
             solver_seconds = 0.0
-            result_analysis_seconds = 0.0
+            result_parse_seconds = 0.0
             try:
                 solver_start = time.monotonic()
                 try:
@@ -1028,7 +1031,7 @@ def execute(task: Task, solver: str, run_dir: Path, label: str,
                         status = {"status": "parse_error", "error": str(exc)}
                 else:
                     status = {"status": "no_result"}
-                result_analysis_seconds = time.monotonic() - analysis_start
+                result_parse_seconds = time.monotonic() - analysis_start
                 status["returncode"] = proc.returncode
                 if proc.returncode != 0:
                     status["status"] = "execution_error"
@@ -1038,7 +1041,8 @@ def execute(task: Task, solver: str, run_dir: Path, label: str,
             status["elapsed_seconds"] = round(time.monotonic() - begin, 3)
             status["_phase_seconds"] = {
                 "solver": solver_seconds,
-                "result_analysis": result_analysis_seconds,
+                "result_parse": result_parse_seconds,
+                "artifact_io": artifact_seconds,
             }
             return status
         finally:
@@ -1052,15 +1056,21 @@ def evaluate_case(task: Task, solver: str, case_dir: Path, seed: int,
                   fuzz_start_monotonic: float | None = None) -> dict:
     """Run a whole MR group in one worker and return compact feedback."""
     worker_start = time.monotonic()
-    phase_seconds = {"metamorphic": 0.0, "solver": 0.0,
-                     "result_analysis": 0.0}
+    phase_seconds = {"metamorphic": 0.0, "execution": 0.0,
+                     "solver": 0.0, "result_parse": 0.0,
+                     "artifact_io": 0.0, "result_analysis": 0.0}
 
     def timed_execute(value: Task, label: str) -> dict:
+        execution_start = time.monotonic()
         result = execute(value, solver, case_dir, label,
                          max_timestep, timeout, lacam_time)
+        execution_seconds = time.monotonic() - execution_start
         timings = result.pop("_phase_seconds", {})
+        artifact_io = timings.get("artifact_io", 0.0)
+        phase_seconds["execution"] += max(0.0, execution_seconds - artifact_io)
         phase_seconds["solver"] += timings.get("solver", 0.0)
-        phase_seconds["result_analysis"] += timings.get("result_analysis", 0.0)
+        phase_seconds["result_parse"] += timings.get("result_parse", 0.0)
+        phase_seconds["artifact_io"] += artifact_io
         return result
 
     rng = random.Random(seed)
@@ -1098,7 +1108,9 @@ def evaluate_case(task: Task, solver: str, case_dir: Path, seed: int,
     worker_finished = time.monotonic()
     worker_elapsed = worker_finished - worker_start
     phase_seconds["other"] = max(
-        0.0, worker_elapsed - sum(phase_seconds.values()))
+        0.0, worker_elapsed - sum(phase_seconds[name] for name in
+                                ("metamorphic", "execution", "artifact_io",
+                                 "result_analysis")))
     payload = {"results": results, "critical_score": c_score, "feature": feature,
                "probes_added": probes_added, "obstacles_added": obstacles_added,
                "phase_seconds": phase_seconds, "worker_elapsed_seconds": worker_elapsed,
@@ -1116,6 +1128,47 @@ def evaluate_case(task: Task, solver: str, case_dir: Path, seed: int,
             os.fsync(stream.fileno())
         os.replace(temporary, case_dir / "payload.json")
     return payload
+
+
+RQ3_CATEGORIES = ("mutation", "metamorphic", "execution", "result_analysis")
+
+
+def rq3_timing_summary(results_path: Path, init_cases: int,
+                       wall_seconds: float | None) -> dict:
+    """Summarize post-initialization times using the paper's four categories."""
+    names = (*RQ3_CATEGORIES, "solver", "result_parse", "artifact_io", "other")
+    totals = {name: 0.0 for name in names}
+    counted = 0
+    incomplete = 0
+    with results_path.open() as stream:
+        for line in stream:
+            row = json.loads(line)
+            if row["case"] < init_cases:
+                continue
+            phases = row.get("phase_seconds", {})
+            if not row.get("timing_complete") or "execution" not in phases:
+                incomplete += 1
+                continue
+            counted += 1
+            for name in names:
+                totals[name] += phases.get(name, 0.0)
+    denominator = sum(totals[name] for name in RQ3_CATEGORIES)
+    return {
+        "post_initialization_cases": counted,
+        "excluded_incomplete_cases": incomplete,
+        "seconds": {name: round(value, 6) for name, value in totals.items()},
+        "categorized_seconds": round(denominator, 6),
+        "category_percent": {
+            name: round(100 * totals[name] / denominator, 3) if denominator else None
+            for name in RQ3_CATEGORIES
+        },
+        "wall_seconds": round(wall_seconds, 3) if wall_seconds is not None else None,
+        "wall_unattributed_seconds": (
+            round(max(0.0, wall_seconds - denominator - totals["artifact_io"]), 6)
+            if wall_seconds is not None else None),
+        "denominator": "sum of post-initialization mutation, metamorphic, "
+                       "execution and result_analysis seconds",
+    }
 
 
 def run(args: argparse.Namespace) -> Path:
@@ -1512,7 +1565,10 @@ def run(args: argparse.Namespace) -> Path:
                 row["phase_seconds"] = {
                     "mutation": round(mutation_seconds, 6),
                     "metamorphic": round(worker_phases.get("metamorphic", 0.0), 6),
+                    "execution": round(worker_phases.get("execution", 0.0), 6),
                     "solver": round(worker_phases.get("solver", 0.0), 6),
+                    "result_parse": round(worker_phases.get("result_parse", 0.0), 6),
+                    "artifact_io": round(worker_phases.get("artifact_io", 0.0), 6),
                     "result_analysis": round(
                         worker_phases.get("result_analysis", 0.0) + scoring_seconds, 6),
                     "other": round(worker_phases.get("other", 0.0), 6),
@@ -1573,6 +1629,9 @@ def run(args: argparse.Namespace) -> Path:
                "dispatch_error": dispatch_error,
                "processing_error": processing_error,
                "manifest": manifest}
+    if workers == 1 and time_limit is not None:
+        summary["rq3_timing"] = rq3_timing_summary(
+            out / "results.jsonl", init_cases, final_fuzz_elapsed)
     if journal is not None:
         if stop_reason in ("case_limit", "time_limit"):
             journal.finish(stop_reason, final_fuzz_elapsed or 0.0, summary)
