@@ -7,16 +7,29 @@ write replayable inputs and JSONL results. Python standard library only.
 from __future__ import annotations
 
 import argparse
+import bisect
+import heapq
 import json
 import math
+import multiprocessing
+import os
 import random
 import re
+import shutil
 import subprocess
 import tempfile
 import time
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from collections import Counter, deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+
+if __package__:
+    from .checkpoint import RunJournal
+else:
+    from checkpoint import RunJournal
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +38,8 @@ LACAM = ROOT / "solvers/lacam3"
 Cell = tuple[int, int]  # row, column
 Pair = tuple[Cell, Cell]
 COORD_RE = re.compile(r"\((\d+),(\d+)\)")  # solver writes (column,row)
+SOC_RELATIONS = ("order", "left_right", "up_down", "rotate_180",
+                 "add_probe", "add_obstacle")
 
 
 @dataclass(frozen=True)
@@ -186,10 +201,14 @@ def critical_score(task: Task, result: dict) -> float:
     shortest = [shortest_path_length(task.grid, start, goal)
                 for start, goal in task.agents]
     travel = [max(0, total - wait) for total, wait in zip(completion, waits)]
-    raw = sum(value > 2 * (sum(waits) / len(waits)) for value in waits) / len(waits) \
-        if sum(waits) else 0.0
-    rad = sum(distance > 0 and actual > 2 * distance
-              for actual, distance in zip(travel, shortest)) / len(shortest)
+    mean_agent_wait = sum(waits) / len(waits)
+    waiting_long = [i for i, value in enumerate(waits)
+                    if mean_agent_wait and value > 2 * mean_agent_wait]
+    path_long = [i for i, (actual, distance) in enumerate(zip(travel, shortest))
+                 if (distance > 0 and actual > 2 * distance)
+                 or (distance == 0 and actual > 0)]
+    raw = len(waiting_long) / len(waits)
+    rad = len(path_long) / len(shortest)
     use = Counter()
     cell_wait = Counter()
     for i, finish in enumerate(completion):
@@ -205,10 +224,16 @@ def critical_score(task: Task, result: dict) -> float:
     total_cells = task.height * task.width
     mean_use = sum(use.values()) / max(1, total_cells)
     mean_wait = sum(cell_wait.values()) / max(1, total_cells)
-    rmu = sum(use[(row, col)] > 2 * mean_use for row in range(task.height)
-              for col in range(task.width)) / max(1, free_count) if mean_use else 0.0
-    rmw = sum(cell_wait[(row, col)] > 2 * mean_wait for row in range(task.height)
-              for col in range(task.width)) / max(1, free_count) if mean_wait else 0.0
+    used_long = [(row, col) for row in range(task.height) for col in range(task.width)
+                 if mean_use and use[(row, col)] > 2 * mean_use]
+    waited_long = [(row, col) for row in range(task.height) for col in range(task.width)
+                   if mean_wait and cell_wait[(row, col)] > 2 * mean_wait]
+    rmu = len(used_long) / max(1, free_count)
+    rmw = len(waited_long) / max(1, free_count)
+    result["critical_wait_agents"] = waiting_long
+    result["critical_long_agents"] = path_long
+    result["critical_used_cells"] = [list(cell) for cell in used_long]
+    result["critical_wait_cells"] = [list(cell) for cell in waited_long]
     # alpha1=alpha2=2*alpha3=2*alpha4 and sum(alpha)=1.
     return (raw + rad) / 3 + (rmu + rmw) / 6
 
@@ -237,13 +262,113 @@ def normalized_nearest_distance(features: tuple[float, ...],
     return result[0] if result else None
 
 
-def diversity_weight(distance: float | None, history: list[float]) -> float:
-    """Artifact novelty buckets; exact brute-force NN replaces its ANN index."""
+class ExactNoveltyIndex:
+    """Exact standardized nearest-neighbor search for local runs."""
+
+    def __init__(self) -> None:
+        self.vectors: list[tuple[float, ...]] = []
+
+    def query(self, features: tuple[float, ...]) -> tuple[float, float | None] | None:
+        return normalized_neighbor_distances(features, self.vectors)
+
+    def add(self, features: tuple[float, ...]) -> None:
+        self.vectors.append(features)
+
+    def build_initial(self) -> None:
+        pass
+
+
+class AnnoyNoveltyIndex:
+    """Author-shaped Annoy index with periodically rebuilt standardized vectors."""
+
+    def __init__(self, dimensions: int = 16, seed: int = 1,
+                 n_trees: int = 50, rebuild_ratio: float = 0.1,
+                 min_rebuild: int = 200, max_rebuild: int = 1000) -> None:
+        try:
+            from annoy import AnnoyIndex
+        except ImportError as exc:
+            raise RuntimeError("ANN mode needs Annoy: python3 -m pip install annoy==1.17.3") from exc
+        self.factory = AnnoyIndex
+        self.dimensions = dimensions
+        self.seed = seed
+        self.n_trees = n_trees
+        self.rebuild_ratio = rebuild_ratio
+        self.min_rebuild = min_rebuild
+        self.max_rebuild = max_rebuild
+        self.vectors: list[tuple[float, ...]] = []
+        self.index = None
+        self.active = False
+        self.indexed_count = 0
+        self.means: tuple[float, ...] = ()
+        self.scales: tuple[float, ...] = ()
+
+    def _normalize(self, vector: tuple[float, ...]) -> tuple[float, ...]:
+        return tuple((value - mean) / scale for value, mean, scale
+                     in zip(vector, self.means, self.scales))
+
+    def build_initial(self) -> None:
+        self.active = True
+        if not self.vectors:
+            return
+        count = len(self.vectors)
+        self.means = tuple(sum(vector[i] for vector in self.vectors) / count
+                           for i in range(self.dimensions))
+        self.scales = tuple(
+            (sum((vector[i] - self.means[i]) ** 2 for vector in self.vectors)
+             / count) ** 0.5 or 1.0 for i in range(self.dimensions))
+        index = self.factory(self.dimensions, "euclidean")
+        index.set_seed(self.seed)
+        for i, vector in enumerate(self.vectors):
+            index.add_item(i, self._normalize(vector))
+        # A single build thread avoids competing with active solver workers.
+        index.build(self.n_trees, n_jobs=1)
+        self.index = index
+        self.indexed_count = count
+
+    def query(self, features: tuple[float, ...]) -> tuple[float, float | None] | None:
+        if len(features) != self.dimensions:
+            raise ValueError(f"Expected {self.dimensions} novelty features")
+        if not self.vectors:
+            return None
+        if self.index is None:
+            # Initial seeds are evaluated before the first static index build.
+            return normalized_neighbor_distances(features, self.vectors)
+        normalized = self._normalize(features)
+        _, indexed_distances = self.index.get_nns_by_vector(
+            normalized, 2, include_distances=True)
+        distances = list(indexed_distances)
+        # Annoy cannot insert into a built tree. Search the small pending buffer
+        # exactly until the next rebuild so newly accepted cases remain visible.
+        for vector in self.vectors[self.indexed_count:]:
+            other = self._normalize(vector)
+            distances.append(sum((a - b) ** 2 for a, b in zip(normalized, other)) ** 0.5)
+        if not distances:
+            return None
+        distances.sort()
+        return distances[0], distances[1] if len(distances) > 1 else None
+
+    def add(self, features: tuple[float, ...]) -> None:
+        if len(features) != self.dimensions:
+            raise ValueError(f"Expected {self.dimensions} novelty features")
+        self.vectors.append(features)
+        if self.active and self.index is None:
+            self.build_initial()
+        elif self.index is not None:
+            threshold = min(self.max_rebuild,
+                            max(self.min_rebuild,
+                                int(len(self.vectors) * self.rebuild_ratio)))
+            if len(self.vectors) - self.indexed_count >= threshold:
+                self.build_initial()
+
+
+def diversity_weight(distance: float | None, history: list[float],
+                     presorted: bool = False) -> float:
+    """Artifact novelty buckets shared by exact and ANN search backends."""
     if distance is None:
         return 1.0
     if len(history) < 20:
         return 0.5 if distance < 0.5 else 1.5 if distance > 2.0 else 1.0
-    ordered = sorted(history)
+    ordered = history if presorted else sorted(history)
     q1 = ordered[(len(ordered) - 1) // 4]
     q3 = ordered[(3 * (len(ordered) - 1)) // 4]
     return 0.5 if distance < q1 else 1.5 if distance > q3 else 1.0
@@ -294,13 +419,46 @@ def generate_task(grid: tuple[str, ...], count: int, rng: random.Random) -> Task
     return Task(grid, pairs)
 
 
+def generate_initial_tasks_per_map(maps: list[tuple[str, tuple[str, ...]]],
+                                   count: int, limit: int) -> list[tuple[str, Task]]:
+    """Artifact's initial generation: up to three tasks on each map, seed 42."""
+    generated: list[tuple[str, Task]] = []
+    for source, grid in maps:
+        if len(generated) >= limit:
+            break
+        regions = [sorted(group) for group in components(grid)
+                   if len(group) >= max(20, 2 * count)]
+        if not regions:
+            continue
+        total = sum(len(region) for region in regions)
+        ideals = [3 * len(region) / total for region in regions]
+        assigned = [int(value) for value in ideals]
+        remaining = 3 - sum(assigned)
+        order = list(range(len(regions)))
+        if remaining:
+            order.sort(key=lambda i: ideals[i] - assigned[i], reverse=True)
+            for i in order[:remaining]:
+                assigned[i] += 1
+        rng = random.Random(42)
+        for i in order:
+            for _ in range(assigned[i]):
+                if len(generated) >= limit:
+                    return generated
+                endpoints = rng.sample(regions[i], 2 * count)
+                agents = tuple((endpoints[j], endpoints[count + j])
+                               for j in range(count))
+                generated.append((source, Task(grid, agents)))
+    return generated
+
+
 def valid_task(task: Task) -> bool:
-    """Cheap paper-style filter: valid distinct endpoints and connected pairs."""
-    endpoints = [cell for pair in task.agents for cell in pair]
-    if len(set(endpoints)) != len(endpoints):
+    """Check distinct starts/goals and connectivity, as in the author artifact."""
+    starts = [start for start, _ in task.agents]
+    goals = [goal for _, goal in task.agents]
+    if len(set(starts)) != len(starts) or len(set(goals)) != len(goals):
         return False
     if any(not (0 <= r < task.height and 0 <= c < task.width)
-           or task.grid[r][c] != "." for r, c in endpoints):
+           or task.grid[r][c] != "." for r, c in starts + goals):
         return False
     labels = {cell: number for number, group in enumerate(components(task.grid))
               for cell in group}
@@ -309,57 +467,184 @@ def valid_task(task: Task) -> bool:
 
 def mutate_agents(parent: Task, feedback: dict, rng: random.Random,
                   guidance_rate: float) -> tuple[Task, str] | None:
-    """Representative agent mutations: guided local shift or paper's unguided moves."""
+    """Choose the paper's guided or unguided agent mutation mode."""
+    if rng.random() >= guidance_rate:
+        return mutate_agents_unguided(parent, rng)
+    return mutate_agents_guided(parent, feedback, rng)
+
+
+def mutate_agents_unguided(parent: Task, rng: random.Random) -> tuple[Task, str] | None:
+    """Paper's four operator families with artifact selection probabilities."""
+    operation = rng.choices(
+        ("agent_regenerate", "agent_swap_subset", "agent_permute_goals",
+         "agent_permute_starts", "agent_relocate_endpoints"),
+        weights=(0.1, 0.3, 0.2, 0.2, 0.2), k=1)[0]
     free = [(r, c) for r, line in enumerate(parent.grid)
             for c, value in enumerate(line) if value == "."]
-    waits = feedback.get("agent_waits", [])
     for _ in range(50):
-        agents = list(parent.agents)
-        if rng.random() < guidance_rate:
-            index = max(range(len(agents)), key=lambda i: waits[i]) if len(waits) == len(agents) \
-                else rng.randrange(len(agents))
-            side = rng.randrange(2)
-            anchor = agents[index][side]
-            candidates = [(r, c) for r, c in free
-                          if 0 < abs(r-anchor[0]) + abs(c-anchor[1]) <= 2]
-            if not candidates:
-                continue
-            pair = list(agents[index])
-            pair[side] = rng.choice(candidates)
-            agents[index] = tuple(pair)
-            operation = "agent_guided_local_shift"
+        if operation == "agent_regenerate":
+            try:
+                candidate = generate_task(parent.grid, len(parent.agents), rng)
+            except ValueError:
+                return None
         else:
-            operation = rng.choice(("agent_swap_subset", "agent_permute_goals",
-                                    "agent_relocate_endpoint", "agent_regenerate"))
+            agents = list(parent.agents)
             if operation == "agent_swap_subset":
-                selected = rng.sample(range(len(agents)), rng.randint(1, len(agents)))
-                for index in selected:
-                    start, goal = agents[index]
-                    agents[index] = (goal, start)
+                agents = [(goal, start) if rng.random() < 0.5 else (start, goal)
+                          for start, goal in agents]
             elif operation == "agent_permute_goals":
-                if len(agents) < 2:
-                    continue
                 goals = [goal for _, goal in agents]
                 rng.shuffle(goals)
                 agents = [(agents[i][0], goals[i]) for i in range(len(agents))]
-            elif operation == "agent_relocate_endpoint":
-                index = rng.randrange(len(agents))
-                side = rng.randrange(2)
-                pair = list(agents[index])
-                pair[side] = rng.choice(free)
-                agents[index] = tuple(pair)
+            elif operation == "agent_permute_starts":
+                starts = [start for start, _ in agents]
+                rng.shuffle(starts)
+                agents = [(starts[i], agents[i][1]) for i in range(len(agents))]
             else:
-                try:
-                    candidate = generate_task(parent.grid, len(agents), rng)
-                except ValueError:
-                    continue
-                if candidate != parent:
-                    return candidate, operation
-                continue
-        candidate = Task(parent.grid, tuple(agents))
+                changed = []
+                for start, goal in agents:
+                    new_goal = rng.choice(free) if rng.random() < 0.2 else goal
+                    new_start = rng.choice(free) if rng.random() < 0.2 else start
+                    changed.append((new_start, new_goal))
+                agents = changed
+            candidate = Task(parent.grid, tuple(agents))
         if candidate != parent and valid_task(candidate):
             return candidate, operation
     return None
+
+
+def guided_agent_operation(task: Task, operation: str, leader: int,
+                           rng: random.Random) -> Task | None:
+    """Move a leader locally or add a shadow/counter-flow agent nearby."""
+    starts = {start for start, _ in task.agents}
+    goals = {goal for _, goal in task.agents}
+    occupied = starts | goals
+    original_start, original_goal = task.agents[leader]
+    if operation == "agent_guided_local_shift":
+        start_anchor, goal_anchor = original_start, original_goal
+    elif operation == "agent_guided_shadow":
+        start_anchor, goal_anchor = original_start, original_goal
+    elif operation == "agent_guided_counterflow":
+        start_anchor, goal_anchor = original_goal, original_start
+    else:
+        raise ValueError(operation)
+    for _ in range(100):
+        start = (start_anchor[0] + rng.randrange(-5, 5),
+                 start_anchor[1] + rng.randrange(-5, 5))
+        goal = (goal_anchor[0] + rng.randrange(-5, 5),
+                goal_anchor[1] + rng.randrange(-5, 5))
+        if (start == goal or start in occupied or goal in occupied
+                or not (0 <= start[0] < task.height and 0 <= start[1] < task.width)
+                or not (0 <= goal[0] < task.height and 0 <= goal[1] < task.width)
+                or task.grid[start[0]][start[1]] != "."
+                or task.grid[goal[0]][goal[1]] != "."):
+            continue
+        agents = list(task.agents)
+        if operation == "agent_guided_local_shift":
+            agents[leader] = (start, goal)
+        else:
+            agents.append((start, goal))
+        candidate = Task(task.grid, tuple(agents))
+        if valid_task(candidate):
+            return candidate
+    return None
+
+
+def guided_congestion_operation(task: Task, hot: Cell,
+                                rng: random.Random) -> Task | None:
+    """Insert an agent whose endpoints straddle a congested cell."""
+    occupied = {cell for pair in task.agents for cell in pair}
+    for _ in range(100):
+        if rng.random() < 0.5:
+            row = hot[0] + rng.randrange(-5, 5)
+            if not 0 <= row < task.height:
+                continue
+            before = [(row, c) for c in range(hot[1])
+                      if task.grid[row][c] == "." and (row, c) not in occupied]
+            after = [(row, c) for c in range(hot[1] + 1, task.width)
+                     if task.grid[row][c] == "." and (row, c) not in occupied]
+        else:
+            col = hot[1] + rng.randrange(-5, 5)
+            if not 0 <= col < task.width:
+                continue
+            before = [(r, col) for r in range(hot[0])
+                      if task.grid[r][col] == "." and (r, col) not in occupied]
+            after = [(r, col) for r in range(hot[0] + 1, task.height)
+                     if task.grid[r][col] == "." and (r, col) not in occupied]
+        if not before or not after:
+            continue
+        candidate = Task(task.grid, task.agents + ((rng.choice(before), rng.choice(after)),))
+        if valid_task(candidate):
+            return candidate
+    return None
+
+
+def mutate_agents_guided(parent: Task, feedback: dict,
+                         rng: random.Random) -> tuple[Task, str] | None:
+    """Apply the four paper roles and restore the original agent count."""
+    original_count = len(parent.agents)
+    if not original_count:
+        return None
+    wait_agents = [i for i in feedback.get("critical_wait_agents", [])
+                   if 0 <= i < original_count]
+    long_agents = [i for i in feedback.get("critical_long_agents", [])
+                   if 0 <= i < original_count]
+    leader_weights = [1.0] * original_count
+    for i in wait_agents + long_agents:
+        leader_weights[i] += 2.0
+    leaders = rng.choices(range(original_count), weights=leader_weights, k=10)
+    current = parent
+    counts = Counter()
+    for leader in leaders:
+        # The author's three paper-listed leader operators have weights 2:3:3.
+        operation = rng.choices(
+            ("agent_guided_local_shift", "agent_guided_shadow",
+             "agent_guided_counterflow"), weights=(2, 3, 3), k=1)[0]
+        if (operation != "agent_guided_local_shift"
+                and len(current.agents) >= 2 * original_count):
+            continue
+        candidate = guided_agent_operation(current, operation, leader, rng)
+        if candidate is not None and candidate != current:
+            current = candidate
+            counts[operation] += 1
+
+    hot = [tuple(cell) for cell in
+           feedback.get("critical_used_cells", []) +
+           feedback.get("critical_wait_cells", [])]
+    if not hot:
+        hot = [tuple(cell) for cell in feedback.get("hot_cells", [])]
+    if hot:
+        for cell in rng.choices(hot, k=5):
+            if len(current.agents) >= 2 * original_count:
+                break
+            candidate = guided_congestion_operation(current, cell, rng)
+            if candidate is not None:
+                current = candidate
+                counts["agent_guided_congestion"] += 1
+
+    added = len(current.agents) - original_count
+    if added:
+        # Remove distinct original agents. Repeating an index, as the artifact
+        # can do, removes too few agents and changes the population size.
+        removal_weights = [1.0] * original_count
+        for i in wait_agents + long_agents:
+            removal_weights[i] -= 0.04
+        remaining = list(range(original_count))
+        removed = set()
+        for _ in range(added):
+            index = rng.choices(remaining,
+                                weights=[removal_weights[i] for i in remaining],
+                                k=1)[0]
+            removed.add(index)
+            remaining.remove(index)
+        agents = [pair for i, pair in enumerate(current.agents)
+                  if i not in removed]
+        current = Task(parent.grid, tuple(agents))
+    if current == parent or len(current.agents) != original_count or not valid_task(current):
+        return None
+    names = ("local_shift", "shadow", "counterflow", "congestion")
+    summary = ",".join(f"{name}={counts['agent_guided_' + name]}" for name in names)
+    return current, f"agent_guided[{summary}]"
 
 
 def mutate_map(parent: Task, feedback: dict, rng: random.Random,
@@ -523,6 +808,66 @@ def transform(task: Task, relation: str, rng: random.Random) -> Task:
     raise ValueError(relation)
 
 
+def trajectory_hot_scores(task: Task, result: dict) -> list[list[float]]:
+    """Artifact hot map: Gaussian-weighted unvisited cells near solution paths."""
+    frames = result.get("_frames", [])
+    if result.get("status") != "solved" or not frames:
+        raise ValueError("Probe and obstacle MRs require a solved original task")
+    visited = {cell for frame in frames for cell in frame}
+    goals = [goal for _, goal in task.agents]
+    frequency = Counter(cell for frame in frames for i, cell in enumerate(frame)
+                        if cell != goals[i])
+    scores = [[0.0] * task.width for _ in range(task.height)]
+    kernel = [(dr, dc, math.exp(-(dr * dr + dc * dc) / 8.0) /
+               ((dr * dr + dc * dc) ** 0.5 + 1e-6))
+              for dr in range(-5, 6) for dc in range(-5, 6)
+              if dr or dc]
+    for (row, col), count in frequency.items():
+        for dr, dc, weight in kernel:
+            r, c = row + dr, col + dc
+            if (0 <= r < task.height and 0 <= c < task.width
+                    and task.grid[r][c] == "." and (r, c) not in visited):
+                scores[r][c] += count * weight
+    return scores
+
+
+def sample_hot_cells(scores: list[list[float]], count: int,
+                     rng: random.Random) -> list[Cell]:
+    """Weighted sampling without replacement via exponential-race keys."""
+    candidates = ((rng.expovariate(weight), (r, c))
+                  for r, row in enumerate(scores) for c, weight in enumerate(row)
+                  if weight > 0)
+    return [cell for _, cell in heapq.nsmallest(count, candidates)]
+
+
+def transform_solution_dependent(task: Task, relation: str, rng: random.Random,
+                                 scores: list[list[float]], number: int = 30) -> Task:
+    """Add up to `number` one-step probes or obstacles off the original paths."""
+    if relation == "add_probe":
+        agents = list(task.agents)
+        for start in sample_hot_cells(scores, 2 * number, rng):
+            if len(agents) - len(task.agents) >= number:
+                break
+            row, col = start
+            if scores[row][col] <= 0:
+                continue
+            destinations = [other for other in neighbors(task.grid, start)
+                            if scores[other[0]][other[1]] > 0]
+            if not destinations:
+                continue
+            goal = rng.choice(destinations)
+            agents.append((start, goal))
+            scores[row][col] = 0.0
+            scores[goal[0]][goal[1]] = 0.0
+        return Task(task.grid, tuple(agents))
+    if relation == "add_obstacle":
+        grid = [list(row) for row in task.grid]
+        for row, col in sample_hot_cells(scores, number, rng):
+            grid[row][col] = "@"
+        return Task(tuple("".join(row) for row in grid), task.agents)
+    raise ValueError(relation)
+
+
 def write_map(task: Task, path: Path) -> None:
     path.write_text(f"type octile\nheight {task.height}\nwidth {task.width}\nmap\n" +
                     "\n".join(task.grid) + "\n")
@@ -675,157 +1020,422 @@ def execute(task: Task, solver: str, run_dir: Path, label: str,
                 solver_map.unlink(missing_ok=True)
 
 
+def evaluate_case(task: Task, solver: str, case_dir: Path, seed: int,
+                  max_timestep: int, timeout: float, lacam_time: float,
+                  cache_payload: bool = False) -> dict:
+    """Run a whole MR group in one worker and return compact feedback."""
+    rng = random.Random(seed)
+    variants = {"original": task}
+    results = {"original": execute(task, solver, case_dir, "original",
+                                    max_timestep, timeout, lacam_time)}
+    hot_scores = (trajectory_hot_scores(task, results["original"])
+                  if results["original"]["status"] == "solved" else None)
+    for relation in ("swap_start_goal", "order", "left_right", "up_down",
+                     "rotate_180", "add_probe", "add_obstacle"):
+        if relation in ("add_probe", "add_obstacle"):
+            if hot_scores is None:
+                continue
+            value = transform_solution_dependent(task, relation, rng, hot_scores)
+        else:
+            value = transform(task, relation, rng)
+        variants[relation] = value
+        results[relation] = execute(value, solver, case_dir, relation,
+                                    max_timestep, timeout, lacam_time)
+    original = results["original"]
+    c_score = critical_score(task, original) if original["status"] == "solved" else 0.0
+    feature = seed_features(task, original) if original["status"] == "solved" else None
+    probes_added = (len(variants["add_probe"].agents) - len(task.agents)
+                    if "add_probe" in variants else None)
+    obstacles_added = (sum(a == "." and b == "@"
+                           for old, new in zip(task.grid, variants["add_obstacle"].grid)
+                           for a, b in zip(old, new))
+                       if "add_obstacle" in variants else None)
+    for result in results.values():
+        result.pop("_frames", None)
+    payload = {"results": results, "critical_score": c_score, "feature": feature,
+               "probes_added": probes_added, "obstacles_added": obstacles_added}
+    if cache_payload:
+        temporary = case_dir / "payload.json.tmp"
+        with temporary.open("w") as stream:
+            json.dump(payload, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, case_dir / "payload.json")
+    return payload
+
+
 def run(args: argparse.Namespace) -> Path:
     rng = random.Random(args.seed)
-    grid = read_map(args.map, args.size)
-    if args.mode == "mutate" and args.patch_size >= min(len(grid), len(grid[0])):
+    resume_enabled = getattr(args, "resume", False)
+    checkpoint_enabled = getattr(args, "checkpoint", False) or resume_enabled
+    novelty_search = getattr(args, "novelty_search", "exact")
+    if novelty_search not in ("exact", "annoy"):
+        raise ValueError(f"Unknown novelty search backend: {novelty_search}")
+    novelty_index = (ExactNoveltyIndex() if novelty_search == "exact"
+                     else AnnoyNoveltyIndex(seed=args.seed))
+    workers = getattr(args, "workers", 1)
+    init_policy = getattr(args, "init_policy", "uniform")
+    case_retention = getattr(args, "case_retention", "all")
+    normal_sample_every = getattr(args, "normal_sample_every", 500)
+    requested_init_cases = getattr(args, "init_cases", 1)
+    time_limit = getattr(args, "time_limit", None)
+    if (workers < 1 or requested_init_cases < 1 or normal_sample_every < 1
+            or init_policy not in ("uniform", "per_map_three")
+            or case_retention not in ("all", "failures_samples")
+            or (time_limit is not None and time_limit <= 0)):
+        raise ValueError("invalid worker, initial seed, retention or time-limit settings")
+    map_dir = getattr(args, "map_dir", None)
+    map_paths = sorted(map_dir.glob("*.map")) if map_dir else [args.map]
+    if not map_paths:
+        raise ValueError(f"No .map files found in {map_dir}")
+    maps = [(str(path.resolve()), read_map(path, args.size)) for path in map_paths]
+    initial_tasks = (generate_initial_tasks_per_map(maps, args.agents,
+                                                    min(args.cases, requested_init_cases))
+                     if init_policy == "per_map_three" else [])
+    init_cases = (min(args.cases, requested_init_cases, len(initial_tasks))
+                  if init_policy == "per_map_three"
+                  else min(args.cases, requested_init_cases))
+    if init_cases == 0:
+        raise ValueError("No eligible initial tasks in the selected maps")
+    if args.mode == "mutate" and any(
+            args.patch_size >= min(len(grid), len(grid[0])) for _, grid in maps):
         raise ValueError("Map mutation needs a local patch: set --patch-size smaller than the map")
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
-    manifest = {"solver": args.solver, "map": str(args.map.resolve()),
+    if checkpoint_enabled and not resume_enabled and (out / "manifest.json").exists():
+        raise FileExistsError(f"Output already has a run; choose another directory: {out}")
+    manifest = {"solver": args.solver, "map": str(map_paths[0].resolve()) if len(maps) == 1 else None,
+                "maps": [path for path, _ in maps],
                 "size": args.size, "agents": args.agents, "seed": args.seed,
-                "cases": args.cases, "threshold": args.threshold,
+                "cases": args.cases, "workers": workers,
+                "init_cases": init_cases, "init_cases_requested": requested_init_cases,
+                "init_policy": init_policy, "time_limit": time_limit,
+                "case_retention": case_retention,
+                "novelty_search": novelty_search,
+                "checkpoint": checkpoint_enabled,
+                "normal_sample_every": normal_sample_every,
+                "threshold": args.threshold,
                 "mode": args.mode, "patch_size": args.patch_size,
                 "agent_mutation_rate": args.agent_mutation_rate,
                 "guidance_rate": args.guidance_rate,
-                "relations": ["order", "left_right", "up_down", "rotate_180",
-                              "swap_start_goal"]}
+                "relations": ["swap_start_goal", "order", "left_right", "up_down",
+                              "rotate_180", "add_probe", "add_obstacle"],
+                "soc_relations": list(SOC_RELATIONS),
+                "solution_dependent_relations": ["add_probe", "add_obstacle"],
+                "probe_and_obstacle_target": 30}
+    journal = RunJournal(out, manifest, resume_enabled) if checkpoint_enabled else None
+    if journal is not None:
+        if resume_enabled:
+            journal.sync_outputs()
+            rng.setstate(journal.meta("rng_state"))
+            for vector in journal.load_features():
+                novelty_index.add(vector)
+            if journal.meta("phase_started"):
+                novelty_index.build_initial()
+            if journal.meta("final_status") in ("case_limit", "time_limit"):
+                journal.close()
+                return out
+        else:
+            journal.set_rng_state(rng.getstate())
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    counts = {"completeness_failure": 0, "cost_gap": 0,
-              "all_unsolved": 0, "invalid_or_error": 0, "other": 0}
-    cf_count = 0
-    of_count = 0
-    seed_pool: list[dict] = []
-    feature_vectors: list[tuple[float, ...]] = []
-    second_neighbor_history: list[float] = []
-    mr_violations = Counter()
+    counts = (journal.meta("counts") if resume_enabled else
+              {"completeness_failure": 0, "cost_gap": 0,
+               "all_unsolved": 0, "invalid_or_error": 0, "other": 0})
+    cf_count = journal.meta("cf_count") if resume_enabled else 0
+    of_count = journal.meta("of_count") if resume_enabled else 0
+    seed_pool: list[dict] = journal.load_seed_pool() if resume_enabled else []
+    second_neighbor_history: list[float] = journal.load_history() if resume_enabled else []
+    mr_violations = Counter(journal.meta("mr_violations")) if resume_enabled else Counter()
     mr_quota = 5
     mr_weight_decay = 0.95
-    with (out / "results.jsonl").open("w") as stream:
-        for case in range(args.cases):
-            parent_case = None
-            mutation = "random_initialization"
-            if args.mode == "mutate" and seed_pool:
-                selected = select_seed(seed_pool, rng)
-                parent_case, parent, feedback = selected["case"], selected["task"], selected["feedback"]
-                mutated = mutate_task(parent, feedback, rng, args.patch_size,
-                                      args.agent_mutation_rate, args.guidance_rate)
-                if mutated is None:
-                    task = generate_task(grid, args.agents, rng)
-                    mutation = "random_fallback"
-                    parent_case = None
-                else:
-                    task, mutation = mutated
-            else:
-                task = generate_task(grid, args.agents, rng)
-            case_dir = out / f"case_{case:05d}"
-            variants = {"original": task}
-            for relation in manifest["relations"]:
-                variants[relation] = transform(task, relation, rng)
-            results = {name: execute(value, args.solver, case_dir, name,
-                                     args.max_timestep, args.timeout, args.lacam_time)
-                       for name, value in variants.items()}
-            good = [value["reported_soc"] for value in results.values()
-                    if value["status"] == "solved"]
-            comparable = [value["reported_soc"] for name, value in results.items()
-                          if name != "swap_start_goal" and value["status"] == "solved"]
-            statuses = [value["status"] for value in results.values()]
-            is_initial_seed = parent_case is None
-            md = ((max(comparable) - min(comparable)) / min(comparable)) \
-                if len(comparable) >= 2 and min(comparable) > 0 else None
-            cf = bool(good) and any(s in ("unsolved", "timeout") for s in statuses)
-            of = md is not None and md > args.threshold
-            invalid_result = any(s not in ("solved", "unsolved", "timeout") for s in statuses)
-            if invalid_result:
-                cf = False
-                of = False
-            # Criticality is calculated from the original trajectory. A successful
-            # original is the only kind of task that can seed the mutation pool.
-            original = results["original"]
-            c_score = critical_score(task, original) if original["status"] == "solved" else 0.0
-            feature = seed_features(task, original) if original["status"] == "solved" else None
-            divergent_mr = None
-            # The artifact skips MR-weight updates when any related run is
-            # unsolved (diff=None), even if the remaining solved runs show OF.
-            if of and not cf and not is_initial_seed and original["status"] == "solved":
-                base_soc = original["reported_soc"]
-                deviations = [(abs(value["reported_soc"] - base_soc) / base_soc, name)
-                              for name, value in results.items()
-                              if name in ("order", "left_right", "up_down", "rotate_180")
-                              and value["status"] == "solved" and base_soc]
-                if deviations:
-                    _, divergent_mr = max(deviations)
-                    mr_violations[divergent_mr] += 1
-            p_score = mr_weight_decay ** max(0, mr_violations[divergent_mr] - mr_quota) \
-                if divergent_mr else 1.0
-            neighbor_distances = normalized_neighbor_distances(feature, feature_vectors) \
-                if feature is not None and not invalid_result else None
-            distance = neighbor_distances[0] if neighbor_distances else None
-            second_distance = neighbor_distances[1] if neighbor_distances else None
-            s_score = diversity_weight(distance, second_neighbor_history)
-            deviations = []
+    def process_complete(case: int, parent_case: int | None, task: Task,
+                         map_source: str,
+                         mutation: str, payload: dict) -> tuple:
+        nonlocal cf_count, of_count
+        results = payload["results"]
+        c_score = payload["critical_score"]
+        feature = payload["feature"]
+        probes_added = payload["probes_added"]
+        obstacles_added = payload["obstacles_added"]
+        good = [value["reported_soc"] for value in results.values()
+                if value["status"] == "solved"]
+        comparable = [value["reported_soc"] for name, value in results.items()
+                      if name in SOC_RELATIONS or name == "original"
+                      if value["status"] == "solved"]
+        statuses = [value["status"] for value in results.values()]
+        is_initial_seed = parent_case is None
+        md = ((max(comparable) - min(comparable)) / min(comparable)) \
+            if len(comparable) >= 2 and min(comparable) > 0 else None
+        cf = bool(good) and any(s in ("unsolved", "timeout") for s in statuses)
+        of = md is not None and md > args.threshold
+        invalid_result = any(s not in ("solved", "unsolved", "timeout") for s in statuses)
+        if invalid_result:
+            cf = False
+            of = False
+        # Criticality is calculated from the original trajectory. A successful
+        # original is the only kind of task that can seed the mutation pool.
+        original = results["original"]
+        divergent_mr = None
+        # The artifact skips MR-weight updates when any related run is
+        # unsolved (diff=None), even if the remaining solved runs show OF.
+        if of and not cf and not is_initial_seed and original["status"] == "solved":
             base_soc = original["reported_soc"]
-            if original["status"] == "solved" and base_soc:
-                for name, value in results.items():
-                    if name not in ("order", "left_right", "up_down", "rotate_180") \
-                            or value["status"] != "solved":
-                        continue
-                    weight = mr_weight_decay ** max(0, mr_violations[name] - mr_quota)
-                    deviations.append(abs(value["reported_soc"] - base_soc) / base_soc * weight)
-            max_weighted_deviation = max(deviations, default=0.0)
-            # The artifact's initial pool keeps solved OF cases but excludes
-            # CF/invalid cases. Later mutated cases are accepted only if they
-            # pass the failure checks.
-            pool_eligible = (original["status"] == "solved" and not cf and not invalid_result
-                             and (is_initial_seed or not of))
-            if parent_case is None:
-                # The artifact doubles the base task fitness for initial seeds.
-                energy = 0.4 * c_score if original["status"] == "solved" else 0.0
-            elif pool_eligible:
-                energy = ((0.2 * c_score + max_weighted_deviation) * s_score *
-                          length_multiplier(original["reported_soc"], len(task.agents)))
-            else:
-                energy = 0.0
-            if second_distance is not None:
-                second_neighbor_history.append(second_distance)
-            feature_index_eligible = (original["status"] == "solved" and not invalid_result
-                                      and (pool_eligible if is_initial_seed else True))
-            if feature is not None and feature_index_eligible:
-                feature_vectors.append(feature)
-            if args.mode == "mutate" and pool_eligible:
-                seed_pool.append({"case": case, "task": task, "feedback": original,
-                                  "energy": energy, "features": feature})
-            if invalid_result:
-                finding = "invalid_or_error"
-                cf = False
-                of = False
-            elif cf:
-                finding = "completeness_failure"
-            elif of:
-                finding = "cost_gap"
-            elif not good:
-                finding = "all_unsolved"
-            else:
-                finding = "other"
-            counts[finding] += 1
-            cf_count += int(cf)
-            of_count += int(of)
-            row = {"case": case, "parent_case": parent_case,
-                   "mutation": mutation, "finding": finding, "cf": cf, "of": of,
-                   "md": md, "critical_score": c_score,
-                   "mr_weight_of_most_divergent": p_score,
-                   "nearest_feature_distance": distance, "diversity_weight": s_score,
-                   "energy": energy, "violating_mr": divergent_mr,
-                   "mr_violation_counts": dict(mr_violations),
-                   "results": {name: {key: value for key, value in result.items()
-                                      if key != "_frames"}
-                               for name, result in results.items()}}
-            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
-            stream.flush()
-            print(f"case {case}: {finding}; MD={md if md is not None else 'N/A'}; E={energy:.3f}")
+            deviations = [(abs(value["reported_soc"] - base_soc) / base_soc, name)
+                          for name, value in results.items()
+                          if name in SOC_RELATIONS
+                          and value["status"] == "solved" and base_soc]
+            if deviations:
+                _, divergent_mr = max(deviations)
+                mr_violations[divergent_mr] += 1
+        p_score = mr_weight_decay ** max(0, mr_violations[divergent_mr] - mr_quota) \
+            if divergent_mr else 1.0
+        neighbor_distances = novelty_index.query(feature) \
+            if feature is not None and not invalid_result else None
+        distance = neighbor_distances[0] if neighbor_distances else None
+        second_distance = neighbor_distances[1] if neighbor_distances else None
+        s_score = diversity_weight(distance, second_neighbor_history, presorted=True)
+        deviations = []
+        base_soc = original.get("reported_soc")
+        if original["status"] == "solved" and base_soc:
+            for name, value in results.items():
+                if name not in SOC_RELATIONS \
+                        or value["status"] != "solved":
+                    continue
+                weight = mr_weight_decay ** max(0, mr_violations[name] - mr_quota)
+                deviations.append(abs(value["reported_soc"] - base_soc) / base_soc * weight)
+        max_weighted_deviation = max(deviations, default=0.0)
+        # The artifact's initial pool keeps solved OF cases but excludes
+        # CF/invalid cases. Later mutated cases are accepted only if they
+        # pass the failure checks.
+        pool_eligible = (original["status"] == "solved" and not cf and not invalid_result
+                         and (is_initial_seed or not of))
+        if parent_case is None:
+            # The artifact doubles the base task fitness for initial seeds.
+            energy = 0.4 * c_score if original["status"] == "solved" else 0.0
+        elif pool_eligible:
+            energy = ((0.2 * c_score + max_weighted_deviation) * s_score *
+                      length_multiplier(original["reported_soc"], len(task.agents)))
+        else:
+            energy = 0.0
+        if second_distance is not None:
+            bisect.insort(second_neighbor_history, second_distance)
+        feature_index_eligible = (original["status"] == "solved" and not invalid_result
+                                  and (pool_eligible if is_initial_seed else True))
+        if feature is not None and feature_index_eligible:
+            novelty_index.add(feature)
+        if args.mode == "mutate" and pool_eligible:
+            seed_pool.append({"case": case, "task": task, "feedback": original,
+                              "energy": energy, "features": feature,
+                              "map_source": map_source})
+        if invalid_result:
+            finding = "invalid_or_error"
+            cf = False
+            of = False
+        elif cf:
+            finding = "completeness_failure"
+        elif of:
+            finding = "cost_gap"
+        elif not good:
+            finding = "all_unsolved"
+        else:
+            finding = "other"
+        keep_case_files = (case_retention == "all" or
+                           finding in ("completeness_failure", "cost_gap",
+                                       "invalid_or_error") or
+                           (finding == "other" and case % normal_sample_every == 0))
+        counts[finding] += 1
+        cf_count += int(cf)
+        of_count += int(of)
+        probe_soc_above_baseline = None
+        if (probes_added is not None and results["original"]["status"] == "solved"
+                and results["add_probe"]["status"] == "solved"):
+            probe_soc_above_baseline = (results["add_probe"]["reported_soc"]
+                                        - results["original"]["reported_soc"]
+                                        - probes_added)
+        row = {"case": case, "parent_case": parent_case,
+               "map_source": map_source,
+               "case_files_selected_for_retention": keep_case_files,
+               "mutation": mutation, "finding": finding, "cf": cf, "of": of,
+               "relation_changes": {
+                   "probes_added": probes_added,
+                   "obstacles_added": obstacles_added,
+                   "probe_soc_above_original_plus_probe_steps": probe_soc_above_baseline,
+               },
+               "md": md, "critical_score": c_score,
+               "mr_weight_of_most_divergent": p_score,
+               "nearest_feature_distance": distance, "diversity_weight": s_score,
+               "energy": energy, "violating_mr": divergent_mr,
+               "mr_violation_counts": dict(mr_violations),
+               "results": {name: {key: value for key, value in result.items()
+                                  if key != "_frames"}
+                           for name, result in results.items()}}
+        return (row, keep_case_files, feature, feature_index_eligible,
+                pool_eligible, second_distance, original)
+    completed = journal.completed_count() if resume_enabled else 0
+    next_case = journal.meta("next_case") if resume_enabled else 0
+    init_completed = journal.meta("init_completed") if resume_enabled else 0
+    fuzz_start = (time.monotonic() - journal.meta("fuzz_elapsed")
+                  if resume_enabled and journal.meta("phase_started") else None)
+    dispatch_error = None
+    processing_error = None
+    pool_context = (ProcessPoolExecutor(max_workers=workers,
+                                        mp_context=multiprocessing.get_context("fork"))
+                    if workers > 1 else nullcontext(None))
+    with (out / "results.jsonl").open("a" if resume_enabled else "w") as stream, pool_context as executor:
+        pending: dict[Future, tuple[int, int | None, Task, str, str]] = {}
+        if resume_enabled:
+            for saved in journal.load_pending():
+                case = saved["case"]
+                task = saved["task"]
+                case_dir = out / f"case_{case:05d}"
+                cached = case_dir / "payload.json"
+                if cached.is_file():
+                    future = Future()
+                    future.set_result(json.loads(cached.read_text()))
+                else:
+                    arguments = (task, args.solver, case_dir, saved["case_seed"],
+                                 args.max_timestep, args.timeout, args.lacam_time, True)
+                    if executor is None:
+                        future = Future()
+                        try:
+                            future.set_result(evaluate_case(*arguments))
+                        except BaseException as exc:
+                            future.set_exception(exc)
+                    else:
+                        future = executor.submit(evaluate_case, *arguments)
+                pending[future] = (case, saved["parent_case"], task,
+                                   saved["map_source"], saved["mutation"])
+        while next_case < args.cases or pending:
+            if init_completed == init_cases and fuzz_start is None:
+                try:
+                    novelty_index.build_initial()
+                    if journal is not None:
+                        journal.start_fuzzing()
+                except Exception as exc:
+                    processing_error = f"initial novelty index build: {exc!r}"
+                    break
+                fuzz_start = time.monotonic()
+            while len(pending) < workers and next_case < args.cases and dispatch_error is None:
+                if next_case >= init_cases and init_completed < init_cases:
+                    break  # Complete initial pool before starting the timed fuzzing phase.
+                if (fuzz_start is not None and time_limit is not None
+                        and time.monotonic() - fuzz_start >= time_limit):
+                    break
+                case = next_case
+                parent_case = None
+                mutation = "random_initialization"
+                selected = None
+                if args.mode == "mutate" and case >= init_cases and seed_pool:
+                    selected = select_seed(seed_pool, rng)
+                    parent_case = selected["case"]
+                    parent = selected["task"]
+                    feedback = selected["feedback"]
+                    map_source = selected["map_source"]
+                    mutated = mutate_task(parent, feedback, rng, args.patch_size,
+                                          args.agent_mutation_rate, args.guidance_rate)
+                    if mutated is None:
+                        map_source, grid = rng.choice(maps)
+                        task = generate_task(grid, args.agents, rng)
+                        mutation = "random_fallback"
+                        parent_case = None
+                    else:
+                        task, mutation = mutated
+                else:
+                    if case < init_cases and init_policy == "per_map_three":
+                        map_source, task = initial_tasks[case]
+                    else:
+                        map_source, grid = rng.choice(maps)
+                        task = generate_task(grid, args.agents, rng)
+                case_dir = out / f"case_{case:05d}"
+                case_seed = rng.randrange(2**63)
+                if journal is not None:
+                    try:
+                        journal.dispatch(case, parent_case, task, map_source,
+                                         mutation, case_seed, rng.getstate(), selected,
+                                         time.monotonic() - fuzz_start
+                                         if fuzz_start is not None else 0.0)
+                    except Exception as exc:
+                        processing_error = f"case {case} checkpoint dispatch: {exc!r}"
+                        break
+                arguments = (task, args.solver, case_dir, case_seed,
+                             args.max_timestep, args.timeout, args.lacam_time,
+                             journal is not None)
+                if executor is None:
+                    future = Future()
+                    try:
+                        future.set_result(evaluate_case(*arguments))
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                else:
+                    try:
+                        future = executor.submit(evaluate_case, *arguments)
+                    except Exception as exc:
+                        dispatch_error = repr(exc)
+                        future = Future()
+                        future.set_exception(exc)
+                pending[future] = (case, parent_case, task, map_source, mutation)
+                next_case += 1
+            if processing_error is not None:
+                break
+            if not pending:
+                break
+            future = next(as_completed(pending))
+            case, parent_case, task, map_source, mutation = pending.pop(future)
+            try:
+                payload = future.result()
+            except Exception as exc:
+                if isinstance(exc, BrokenProcessPool):
+                    dispatch_error = repr(exc)
+                # A failed case is recorded without losing other completed work.
+                payload = {"results": {"original": {
+                    "status": "execution_error", "error": repr(exc)}},
+                    "critical_score": 0.0, "feature": None,
+                    "probes_added": None, "obstacles_added": None}
+            try:
+                row, keep_files, feature, feature_eligible, pool_eligible, \
+                    second_distance, feedback = process_complete(
+                        case, parent_case, task, map_source, mutation, payload)
+                next_init_completed = init_completed + int(case < init_cases)
+                if journal is not None:
+                    journal.complete(
+                        case, row, keep_files, task, feedback, feature,
+                        feature_eligible, pool_eligible and args.mode == "mutate",
+                        second_distance, counts, cf_count, of_count,
+                        dict(mr_violations), next_init_completed,
+                        time.monotonic() - fuzz_start if fuzz_start is not None else 0.0)
+                    completed += 1
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+                stream.flush()
+                if journal is None:
+                    completed += 1
+                if not keep_files:
+                    shutil.rmtree(out / f"case_{case:05d}")
+                print(f"case {case}: {row['finding']}; "
+                      f"MD={row['md'] if row['md'] is not None else 'N/A'}; "
+                      f"E={row['energy']:.3f}")
+            except Exception as exc:
+                processing_error = f"case {case} processing: {exc!r}"
+                break
+            init_completed = next_init_completed
+    stop_reason = ("processing_error" if processing_error is not None else
+                   "worker_pool_error" if dispatch_error is not None else
+                   "time_limit" if completed < args.cases else "case_limit")
     (out / "summary.json").write_text(json.dumps(
         {"counts": counts, "cf_count": cf_count, "of_count": of_count,
+         "completed_cases": completed, "requested_cases": args.cases,
+         "stop_reason": stop_reason,
+         "dispatch_error": dispatch_error,
+         "processing_error": processing_error,
          "manifest": manifest}, indent=2) + "\n")
+    if journal is not None:
+        if stop_reason in ("case_limit", "time_limit"):
+            journal.finish(stop_reason, time.monotonic() - fuzz_start
+                           if fuzz_start is not None else 0.0)
+        journal.close()
+    if processing_error is not None:
+        raise RuntimeError(f"Experiment stopped early: {processing_error}; see {out / 'summary.json'}")
+    if dispatch_error is not None:
+        raise RuntimeError(f"Worker pool stopped early: {dispatch_error}; see {out / 'summary.json'}")
     return out
 
 
@@ -833,9 +1443,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--solver", choices=["pibt", "hca", "pibt_plus", "lacam3"], default="pibt")
     parser.add_argument("--map", type=Path, default=PIBT / "map/empty-8-8.map")
+    parser.add_argument("--map-dir", type=Path,
+                        help="sample initial seeds from every .map in this directory")
     parser.add_argument("--size", type=int, help="nearest-neighbor resize of whole map")
     parser.add_argument("--agents", type=int, default=4)
     parser.add_argument("--cases", type=int, default=3)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--init-cases", type=int, default=1)
+    parser.add_argument("--init-policy", choices=("uniform", "per_map_three"),
+                        default="uniform")
+    parser.add_argument("--case-retention", choices=("all", "failures_samples"),
+                        default="all")
+    parser.add_argument("--normal-sample-every", type=int, default=500)
+    parser.add_argument("--novelty-search", choices=("exact", "annoy"),
+                        default="exact")
+    parser.add_argument("--time-limit", type=float,
+                        help="seconds of fuzzing after the initial seed phase")
+    parser.add_argument("--checkpoint", action="store_true",
+                        help="persist each dispatch and completed group for recovery")
+    parser.add_argument("--resume", action="store_true",
+                        help="continue an interrupted --checkpoint run in --output")
     parser.add_argument("--mode", choices=["baseline", "mutate"], default="baseline")
     parser.add_argument("--patch-size", type=int, default=32)
     parser.add_argument("--agent-mutation-rate", type=float, default=0.5)
@@ -847,7 +1474,10 @@ def main() -> None:
     parser.add_argument("--max-timestep", type=int, default=1000)
     parser.add_argument("--output", type=Path, default=ROOT / "reproduce/output/demo")
     args = parser.parse_args()
-    if args.agents < 1 or args.cases < 1 or args.timeout <= 0 or args.lacam_time < 1:
+    if (args.agents < 1 or args.cases < 1 or args.workers < 1
+            or args.init_cases < 1 or args.normal_sample_every < 1
+            or args.timeout <= 0 or args.lacam_time < 1
+            or (args.time_limit is not None and args.time_limit <= 0)):
         parser.error("agents, cases and timeout must be positive; lacam-time must be at least 1 second")
     if args.patch_size < 1 or not 0 <= args.agent_mutation_rate <= 1 or not 0 <= args.guidance_rate <= 1:
         parser.error("patch-size must be positive; mutation rates must be between 0 and 1")
