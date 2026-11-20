@@ -5,10 +5,16 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+if __package__:
+    from .validate_outputs import Report, validate_job
+else:
+    from validate_outputs import Report, validate_job
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +22,25 @@ CORE = ROOT / "reproduce/run_pairs.py"
 MAPS = ROOT / "data/maps"
 SERVER_OUTPUT = ROOT / "reproduce/output/server"
 SOLVERS = ("pibt", "hca", "pibt_plus", "lacam3")
+MIN_START_FREE_BYTES = 50 * 1024 ** 3
+MIN_CONTINUE_FREE_BYTES = 20 * 1024 ** 3
+
+
+def validate_completed_job(job: dict, plan: dict) -> bool:
+    """Stop a long server batch before the next job if its output is incomplete."""
+    report = Report()
+    validate_job(Path(job["output"]), job, plan["profile"], report, True, plan)
+    for warning in report.warnings:
+        print(f"WARN {warning}", file=sys.stderr)
+    for error in report.errors:
+        print(f"FAIL {error}", file=sys.stderr)
+    if report.errors:
+        print(f"Stopped after output validation failed; files kept in {plan['output_root']}",
+              file=sys.stderr)
+        return False
+    print(f"Validated {job['solver']} repeat {job['repeat']}: "
+          f"{report.cases_checked} cases, {len(report.warnings)} warnings", flush=True)
+    return True
 
 
 def build_plan(args: argparse.Namespace) -> dict:
@@ -110,9 +135,18 @@ def main() -> int:
         run_root.mkdir(parents=True, exist_ok=False)
         (run_root / "server_manifest.json").write_text(
             json.dumps(plan, ensure_ascii=False, indent=2) + "\n")
-    for job in plan["jobs"]:
+    for job_index, job in enumerate(plan["jobs"]):
         output = Path(job["output"])
         checkpoint = output / "checkpoint.sqlite3"
+        minimum_free = (MIN_START_FREE_BYTES if job_index == 0 and not checkpoint.is_file()
+                        else MIN_CONTINUE_FREE_BYTES)
+        available = shutil.disk_usage(run_root).free
+        if available < minimum_free:
+            print(f"Stopped before {job['solver']} repeat {job['repeat']}: "
+                  f"disk free {available / 1024 ** 3:.1f} GiB is below "
+                  f"{minimum_free / 1024 ** 3:.0f} GiB; files kept in {run_root}",
+                  file=sys.stderr)
+            return 3
         if args.resume_run is not None and output.exists() and not checkpoint.is_file():
             if not output.is_dir() or any(
                     path.name != "checkpoint.lock" for path in output.iterdir()):
@@ -142,6 +176,8 @@ def main() -> int:
             print(f"Stopped after exit code {completed.returncode}; files kept in {run_root}",
                   file=sys.stderr)
             return completed.returncode
+        if not validate_completed_job(job, plan):
+            return 2
     print(f"Server outputs: {run_root}")
     return 0
 

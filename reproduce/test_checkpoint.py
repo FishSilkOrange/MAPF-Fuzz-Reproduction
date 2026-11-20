@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -285,13 +285,55 @@ class CheckpointChecks(unittest.TestCase):
                                   pnoise2=lambda *_args: 0.0)), \
                  patch.object(run_server.subprocess, "run",
                               return_value=SimpleNamespace(returncode=0)) as call, \
+                 patch.object(run_server.shutil, "disk_usage",
+                              return_value=SimpleNamespace(free=100 * 1024 ** 3)), \
+                 patch.object(run_server, "validate_completed_job", return_value=True) as validate, \
                  redirect_stdout(io.StringIO()):
                 self.assertEqual(run_server.main(), 0)
             self.assertEqual(call.call_count, 2)
+            self.assertEqual(validate.call_count, 2)
             commands = [entry.args[0] for entry in call.call_args_list]
             self.assertTrue(all("--resume" in command for command in commands))
             self.assertEqual([command[command.index("--output") + 1]
                               for command in commands], [str(first), str(second)])
+            with patch.object(sys, "argv", argv), \
+                 patch.object(run_server.importlib, "import_module",
+                              return_value=SimpleNamespace(
+                                  AnnoyIndex=object, ndarray=object,
+                                  pnoise2=lambda *_args: 0.0)), \
+                 patch.object(run_server.subprocess, "run",
+                              return_value=SimpleNamespace(returncode=0)) as call, \
+                 patch.object(run_server.shutil, "disk_usage",
+                              return_value=SimpleNamespace(free=100 * 1024 ** 3)), \
+                 patch.object(run_server, "validate_completed_job", return_value=False), \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(run_server.main(), 2)
+            self.assertEqual(call.call_count, 1)
+            with patch.object(sys, "argv", argv), \
+                 patch.object(run_server.importlib, "import_module",
+                              return_value=SimpleNamespace(
+                                  AnnoyIndex=object, ndarray=object,
+                                  pnoise2=lambda *_args: 0.0)), \
+                 patch.object(run_server.shutil, "disk_usage",
+                              return_value=SimpleNamespace(free=0)), \
+                 patch.object(run_server.subprocess, "run") as call, \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(run_server.main(), 3)
+            call.assert_not_called()
+            (first / "checkpoint.sqlite3").unlink()
+            (first / "summary.json").unlink()
+            (second / "checkpoint.sqlite3").unlink()
+            with patch.object(sys, "argv", argv), \
+                 patch.object(run_server.importlib, "import_module",
+                              return_value=SimpleNamespace(
+                                  AnnoyIndex=object, ndarray=object,
+                                  pnoise2=lambda *_args: 0.0)), \
+                 patch.object(run_server.shutil, "disk_usage",
+                              return_value=SimpleNamespace(free=30 * 1024 ** 3)), \
+                 patch.object(run_server.subprocess, "run") as call, \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(run_server.main(), 3)
+            call.assert_not_called()
 
     def test_rq3_entry_uses_separate_single_worker_profile(self):
         argv = ["run_rq3.py", "--solver", "pibt", "--execute"]

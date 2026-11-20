@@ -6,7 +6,7 @@
 
 课程展示的当前目标是 RQ1 主实验和 RQ3 效率实验。RQ2、RQ4 暂不复现或制作可视化；RQ1 中的 MET-MAPF 对照、迷宫地图补充、LaCAM* 30 秒复测和参与者问卷也暂缓，待主实验与演讲结果完成后再决定是否追加。
 
-本机预检入口 `reproduce/run_local.py` 固定 128×128、50 agents、单 worker，使用精确最近邻，输出到带时间戳的 `reproduce/output/local/`。服务器入口 `reproduce/run_server.py` 固定 128×128、100 agents，使用 Annoy，入口默认规划 32 workers；本课程的正式执行计划指定 6 workers。初始任务按作者流程每图最多 3 组；现有 30 张地图最多约 90 组。服务器结果进入独立的 `reproduce/output/server/`，保留所有 JSONL 行、失败案例文件和每 500 组一份正常案例文件。入口默认只打印计划，`--execute` 才启动。中心种子池、并发任务组调度和 SQLite 断点续跑已接通；服务器正式规模预测试仍未完成。执行步骤见 [EXPERIMENT_PLAN.md](EXPERIMENT_PLAN.md)。
+本机预检入口 `reproduce/run_local.py` 固定 128×128、50 agents、单 worker，使用精确最近邻，输出到带时间戳的 `reproduce/output/local/`。服务器入口 `reproduce/run_server.py` 固定 128×128、100 agents，使用 Annoy，入口默认规划 32 workers；本课程的正式执行计划指定 6 workers。初始任务按作者流程每图最多 3 组；30 张地图均可生成初始任务，共 90 组。服务器结果进入独立的 `reproduce/output/server/`，保留所有 JSONL 行、失败案例文件和每 500 组一份正常案例文件。入口默认只打印计划，`--execute` 才启动。中心种子池、并发任务组调度和 SQLite 断点续跑已在正式规模短跑中通过验收。执行步骤见 [EXPERIMENT_PLAN.md](EXPERIMENT_PLAN.md)。
 
 ## 已完成
 
@@ -27,8 +27,8 @@
 
 ## 尚未完成
 
-1. **实现审查与冻结：**CA/DLA、热点区域和 Annoy 阈值已在本地补齐；仍需只读审查 agent 完成论文对照和项目回归检查。随机 patch 中作者不可达的 Perlin 分支未启用，CA 预设中的 Perlin 已启用；作者额外的 appointment/naughty 仍按既定范围省略。
-2. **RQ1/RQ3 长跑准备：**主实验入口已规划 5 次重复、20,000/25,000 组上限及 1h/6h 时限；RQ3 入口使用单 worker 与每求解器 1 小时。本地小任务已经运行真实 Annoy；正式长跑前还需完成服务器 128×128/100 agents 的四求解器短跑、断点续跑和数据验收。
+1. **实现审查与冻结：**CA/DLA、热点区域和 Annoy 阈值已补齐并经只读审查 agent 核对。随机 patch 中作者不可达的 Perlin 分支未启用，CA 预设中的 Perlin 已启用；作者额外的 appointment/naughty 仍按既定范围省略。服务器 `.venv` 已运行真实 Perlin CA、DLA 和 Annoy 检查。
+2. **RQ1/RQ3 长跑准备：**主实验入口已规划 5 次重复、20,000/25,000 组上限及 1h/6h 时限；RQ3 入口使用单 worker 与每求解器 1 小时。服务器四求解器 RQ1 短跑共 48 组、RQ3 单求解器短跑 6 组，以及 PIBT 中断续跑 100 组，均通过输出验收；正式长跑尚未开始。
 3. **数据汇总与 presentation：**已有输出字段验证器；尚未做正式批量统计、RQ1 失败案例图、RQ3 阶段占比图和幻灯片。
 4. **暂缓的论文实验：**MET-MAPF 基线、迷宫、LaCAM* 30 秒复测与问卷；RQ2 多规模和 RQ4 消融由用户决定暂不做。RQ1 的不同 MD 阈值计数可从主实验 JSONL 事后分析，但其可视化尚未制作。
 
@@ -50,4 +50,4 @@
 
 ## 服务器运行顺序
 
-按 [EXPERIMENT_PLAN.md](EXPERIMENT_PLAN.md) 先完成正式规模预测试和数据验收，再冻结代码运行 RQ3 和 RQ1。presentation 应明确标注 RQ1 的 6 worker 与论文 32 worker 的差异。
+正式规模预测试和数据验收已完成；按 [EXPERIMENT_PLAN.md](EXPERIMENT_PLAN.md) 冻结代码后运行 RQ3 和 RQ1。presentation 应明确标注 RQ1 的 6 worker 与论文 32 worker 的差异。

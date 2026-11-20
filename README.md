@@ -49,6 +49,6 @@ python3 reproduce/run_local.py --solver all --cases 3 --seed 1
 
 此入口固定为 128×128、50 个智能体、单进程，用于本机预检；`--solver` 可选 `all`、`pibt`、`hca`、`pibt_plus` 或 `lacam3`。每次运行会创建独立的时间戳目录 `reproduce/output/local/`，不会覆盖之前的本机结果。
 
-`run_pairs.py` 是本机与服务器共用的实验核心；本机入口固定单进程、精确最近邻并保留全部案例文件。服务器入口 `reproduce/run_server.py` 默认先打印论文主实验计划，只有添加 `--execute` 才开始运行，结果写入独立的 `reproduce/output/server/`。服务器使用 Annoy 索引，按作者代码每张地图最多生成 3 个初始任务，保留全部 JSONL 统计及失败案例文件，并每 500 组保留一组正常案例。服务器任务现使用 SQLite 检查点；中断后以 `--resume-run` 指向原时间戳目录继续。批量统计和真实 Annoy 的服务器规模性能验证尚未完成。更多参数和当前实现范围见 [reproduce/README.md](reproduce/README.md)。
+`run_pairs.py` 是本机与服务器共用的实验核心；本机入口固定单进程、精确最近邻并保留全部案例文件。服务器入口 `reproduce/run_server.py` 默认先打印论文主实验计划，只有添加 `--execute` 才开始运行，结果写入独立的 `reproduce/output/server/`。服务器使用 Annoy 索引，按作者代码每张地图最多生成 3 个初始任务，保留全部 JSONL 统计及失败案例文件，并每 500 组保留一组正常案例。服务器任务使用 SQLite 检查点；中断后以 `--resume-run` 指向原时间戳目录继续。128×128、100 agent 的四求解器短跑和断点续跑已通过验收；正式 RQ1/RQ3 长跑与批量统计仍待进行。更多参数和当前实现范围见 [reproduce/README.md](reproduce/README.md)。
 
 当前课程展示聚焦 RQ1 主实验与 RQ3 效率实验。RQ3 独立入口 `reproduce/run_rq3.py` 固定单进程、每求解器 1 小时，输出到 `reproduce/output/rq3/`；所有结果行均记录完成时刻和分阶段耗时。批量统计与可视化尚未完成。
