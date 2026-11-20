@@ -97,10 +97,14 @@ def main() -> int:
     if not args.execute:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return 0
-    try:
-        getattr(importlib.import_module("annoy"), "AnnoyIndex")
-    except (ImportError, OSError, AttributeError):
-        parser.error("server ANN mode needs Annoy: python3 -m pip install -r reproduce/requirements-server.txt")
+    for module_name, required_attribute in (("annoy", "AnnoyIndex"),
+                                            ("numpy", "ndarray"),
+                                            ("noise", "pnoise2")):
+        try:
+            getattr(importlib.import_module(module_name), required_attribute)
+        except (ImportError, OSError, AttributeError):
+            parser.error(f"server mode needs {module_name}: install "
+                         "reproduce/requirements-server.txt in the active Python environment")
     run_root = Path(plan["output_root"])
     if args.resume_run is None:
         run_root.mkdir(parents=True, exist_ok=False)

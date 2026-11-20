@@ -9,12 +9,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from reproduce.run_pairs import (AnnoyNoveltyIndex, ExactNoveltyIndex, Task,
-                                 diversity_weight, generate_initial_tasks_per_map,
+from reproduce.run_pairs import (AnnoyNoveltyIndex, CA_PRESET_CONFIGS,
+                                 ExactNoveltyIndex, Task, cellular_automata_patch,
+                                 critical_score, critical_windows, diversity_weight,
+                                 generate_initial_tasks_per_map, generate_map_patch,
                                  guided_agent_operation,
                                  guided_congestion_operation, mutate_agents,
                                  mutate_agents_unguided, mutate_map,
-                                 length_multiplier, normalized_nearest_distance,
+                                 length_multiplier, linear_percentile,
+                                 normalized_nearest_distance,
                                  read_map, seed_features, select_seed, transform,
                                  trajectory_hot_scores, transform_solution_dependent,
                                  valid_task, validate_solution)
@@ -41,6 +44,10 @@ class MutationChecks(unittest.TestCase):
                                for index, other in self.vectors.items())[:count]
                 return [index for _, index in pairs], [distance for distance, _ in pairs]
 
+            def get_nns_by_item(self, item, count, include_distances=False):
+                return self.get_nns_by_vector(self.vectors[item], count,
+                                              include_distances=include_distances)
+
         exact = ExactNoveltyIndex()
         with patch.dict(sys.modules, {"annoy": types.SimpleNamespace(AnnoyIndex=FakeAnnoyIndex)}):
             ann = AnnoyNoveltyIndex(dimensions=2, seed=7, n_trees=3,
@@ -54,7 +61,7 @@ class MutationChecks(unittest.TestCase):
         self.assertEqual(ann.query((2.0, 0.0))[0], 0.0)
         ann.add((10.0, 10.0))
         self.assertEqual(ann.indexed_count, 2)
-        self.assertEqual(ann.query((10.0, 10.0))[0], 0.0)
+        self.assertGreater(ann.query((10.0, 10.0))[0], 0.0)
         with patch.dict(sys.modules, {"annoy": types.SimpleNamespace(AnnoyIndex=FakeAnnoyIndex)}):
             restored = AnnoyNoveltyIndex(dimensions=2, seed=7, n_trees=3,
                                          min_rebuild=2, max_rebuild=2)
@@ -71,6 +78,23 @@ class MutationChecks(unittest.TestCase):
         empty_initial.build_initial()
         empty_initial.add((1.0, 1.0))
         self.assertEqual(empty_initial.indexed_count, 1)
+
+        # Thresholds use second-neighbor distances among indexed vectors,
+        # rather than second-neighbor distances of past mutation queries.
+        with patch.dict(sys.modules, {"annoy": types.SimpleNamespace(AnnoyIndex=FakeAnnoyIndex)}):
+            thresholds = AnnoyNoveltyIndex(dimensions=2, seed=7, n_trees=3)
+        for i in range(20):
+            thresholds.add((float(i), float(i % 3)))
+        thresholds.build_initial()
+        second_neighbors = sorted(
+            thresholds.index.get_nns_by_item(i, 2, include_distances=True)[1][1]
+            for i in range(20))
+        self.assertAlmostEqual(thresholds.low_novelty_threshold,
+                               linear_percentile(second_neighbors, .25))
+        self.assertAlmostEqual(thresholds.high_novelty_threshold,
+                               linear_percentile(second_neighbors, .75))
+        self.assertEqual(thresholds.novelty_weight(0.0), .5)
+        self.assertEqual(thresholds.novelty_weight(100.0), 1.5)
 
     def test_author_initialization_generates_at_most_three_per_map(self):
         grid = (".....@....",) * 10
@@ -151,7 +175,8 @@ class MutationChecks(unittest.TestCase):
     def test_map_mutation_is_local_and_preserves_endpoints(self):
         parent = Task(("." * 16,) * 16,
                       (((0, 0), (15, 15)), ((0, 15), (15, 0))))
-        result = mutate_map(parent, {"hot_cells": [[8, 8], [9, 8]]}, random.Random(3), 4)
+        result = mutate_map(parent, {"_waiting_freq": [(8, 8, 10), (9, 8, 5)]},
+                            random.Random(0), 4)
         self.assertIsNotNone(result)
         child, operation = result
         self.assertRegex(operation, r"^map_(uniform|ca|dla)(_(uniform|ca|dla))*_patch_x[1-3]$")
@@ -160,18 +185,50 @@ class MutationChecks(unittest.TestCase):
         changed = sum(a != b for old, new in zip(parent.grid, child.grid)
                       for a, b in zip(old, new))
         self.assertGreater(changed, 0)
-        self.assertLessEqual(changed, 4 * 4)
+        self.assertLessEqual(changed, 3 * 4 * 4)
 
     def test_map_mutation_can_apply_multiple_hotspot_patches(self):
         parent = Task(("." * 32,) * 32,
-                      (((0, 0), (31, 31)), ((0, 31), (31, 0))))
+                      (((10, 10), (20, 20)), ((10, 20), (20, 10))))
         result = mutate_map(parent,
-                            {"hot_cells": [[8, 8], [16, 8], [24, 24]]},
+                            {"_waiting_freq": [(0, 0, 10), (0, 31, 9),
+                                                (31, 0, 8)]},
                             random.Random(5), 4)
         self.assertIsNotNone(result)
         child, operation = result
         self.assertRegex(operation, r"_patch_x[2-3]$")
         self.assertTrue(valid_task(child))
+
+    def test_map_generators_match_author_presets_and_waiting_windows(self):
+        self.assertEqual(len(CA_PRESET_CONFIGS), 26)
+        self.assertEqual(sum(noise_type == "Perlin" for _, noise_type, _, _
+                             in CA_PRESET_CONFIGS), 8)
+        border = ("@@@@@", "@...@", "@...@", "@...@", "@@@@@")
+        normal = cellular_automata_patch(border, random.Random(1),
+                                         (1, "normal", 1.0, "Conway"))
+        self.assertEqual(normal[0], border[0])
+        self.assertEqual(normal[2][2], ".")
+        calls = []
+        fake_noise = types.SimpleNamespace(
+            pnoise2=lambda x, y, **_kwargs: calls.append((x, y)) or x + y)
+        with patch.dict(sys.modules, {"noise": fake_noise}):
+            perlin = cellular_automata_patch(border, random.Random(2),
+                                             (2, "Perlin", .3, "Maze"))
+        self.assertEqual(len(calls), 25)
+        self.assertEqual(perlin[0], border[0])
+        self.assertEqual(perlin[-1], border[-1])
+        dla = generate_map_patch(border, "dla", random.Random(3))
+        self.assertEqual(dla[0], border[0])
+        self.assertTrue(any("@" in row[1:-1] for row in dla[1:-1]))
+
+        task = Task(("....",) * 4, (((0, 0), (0, 1)),))
+        result = {"_frames": [[(0, 0)], [(0, 0)], [(0, 1)]],
+                  "agent_completion": [2], "agent_waits": [1]}
+        critical_score(task, result)
+        self.assertEqual(result["_waiting_freq"], [(0, 0, 1)])
+        windows = critical_windows({"_waiting_freq": [(6, 6, 10)]}, 8, 8, 2)
+        self.assertTrue(any(r <= 6 < r + 2 and c <= 6 < c + 2
+                            for r, c in windows))
 
     def test_seed_features_and_diversity_scores(self):
         task = Task(("....", ".@..", "....", "...."),

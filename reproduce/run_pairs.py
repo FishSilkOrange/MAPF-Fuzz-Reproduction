@@ -1,8 +1,4 @@
-"""Small, independent first stage of the MAPF-Fuzz course reproduction.
-
-Generate MAPF instances, run one solver on symmetry-related instances, and
-write replayable inputs and JSONL results. Python standard library only.
-"""
+"""MAPF-Fuzz RQ1/RQ3 runner with replayable inputs and checkpointed results."""
 
 from __future__ import annotations
 
@@ -10,6 +6,7 @@ import argparse
 import bisect
 import hashlib
 import heapq
+import importlib.metadata
 import json
 import math
 import multiprocessing
@@ -18,6 +15,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -237,6 +235,10 @@ def critical_score(task: Task, result: dict) -> float:
     result["critical_long_agents"] = path_long
     result["critical_used_cells"] = [list(cell) for cell in used_long]
     result["critical_wait_cells"] = [list(cell) for cell in waited_long]
+    # Keep the complete waiting-frequency map as sparse seed feedback. The
+    # paper's map mutation ranks 32x32 windows using this map, not top-30 cells.
+    result["_waiting_freq"] = [(row, col, count)
+                               for (row, col), count in sorted(cell_wait.items())]
     # alpha1=alpha2=2*alpha3=2*alpha4 and sum(alpha)=1.
     return (raw + rad) / 3 + (rmu + rmw) / 6
 
@@ -263,6 +265,14 @@ def normalized_nearest_distance(features: tuple[float, ...],
                                 vectors: list[tuple[float, ...]]) -> float | None:
     result = normalized_neighbor_distances(features, vectors)
     return result[0] if result else None
+
+
+def linear_percentile(ordered: list[float], quantile: float) -> float:
+    """NumPy percentile's default linear interpolation on sorted values."""
+    position = (len(ordered) - 1) * quantile
+    low = math.floor(position)
+    high = math.ceil(position)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
 class ExactNoveltyIndex:
@@ -304,6 +314,8 @@ class AnnoyNoveltyIndex:
         self.indexed_count = 0
         self.means: tuple[float, ...] = ()
         self.scales: tuple[float, ...] = ()
+        self.low_novelty_threshold = 0.5
+        self.high_novelty_threshold = 2.0
 
     def _normalize(self, vector: tuple[float, ...]) -> tuple[float, ...]:
         return tuple((value - mean) / scale for value, mean, scale
@@ -327,6 +339,16 @@ class AnnoyNoveltyIndex:
         index.build(self.n_trees, n_jobs=1)
         self.index = index
         self.indexed_count = count
+        if count >= 20:
+            second_neighbors = []
+            for i in range(count):
+                _, distances = index.get_nns_by_item(i, 2, include_distances=True)
+                if len(distances) > 1:
+                    second_neighbors.append(distances[1])
+            if second_neighbors:
+                second_neighbors.sort()
+                self.low_novelty_threshold = linear_percentile(second_neighbors, .25)
+                self.high_novelty_threshold = linear_percentile(second_neighbors, .75)
 
     def restore_indexed_prefix(self, count: int) -> None:
         """Rebuild only the last committed tree; retain newer vectors in buffer."""
@@ -349,17 +371,19 @@ class AnnoyNoveltyIndex:
             return normalized_neighbor_distances(features, self.vectors)
         normalized = self._normalize(features)
         _, indexed_distances = self.index.get_nns_by_vector(
-            normalized, 2, include_distances=True)
-        distances = list(indexed_distances)
-        # Annoy cannot insert into a built tree. Search the small pending buffer
-        # exactly until the next rebuild so newly accepted cases remain visible.
-        for vector in self.vectors[self.indexed_count:]:
-            other = self._normalize(vector)
-            distances.append(sum((a - b) ** 2 for a, b in zip(normalized, other)) ** 0.5)
-        if not distances:
-            return None
-        distances.sort()
-        return distances[0], distances[1] if len(distances) > 1 else None
+            normalized, 1, include_distances=True)
+        # The author queries only the built tree; pending vectors enter at the
+        # next rebuild. A second neighbor is not used by this ANN mode.
+        return (indexed_distances[0], None) if indexed_distances else None
+
+    def novelty_weight(self, distance: float | None) -> float:
+        if distance is None:
+            return 1.0
+        if distance < self.low_novelty_threshold:
+            return 0.5
+        if distance > self.high_novelty_threshold:
+            return 1.5
+        return 1.0
 
     def add(self, features: tuple[float, ...]) -> None:
         if len(features) != self.dimensions:
@@ -661,36 +685,62 @@ def mutate_agents_guided(parent: Task, feedback: dict,
     return current, f"agent_guided[{summary}]"
 
 
+def critical_windows(feedback: dict, height: int, width: int,
+                     patch_size: int, count: int = 3) -> list[tuple[int, int]]:
+    """Rank full waiting-frequency windows, using the paper's intended sum."""
+    import numpy as np
+
+    if patch_size > min(height, width):
+        raise ValueError("--patch-size exceeds the resized map dimensions")
+    freq = np.zeros((height, width), dtype=np.float32)
+    for row, col, value in feedback.get("_waiting_freq", []):
+        freq[row, col] = value
+    # The artifact omits both cumulative sums; the paper calls for the total
+    # waiting frequency in each window, so use the actual summed-area table.
+    integral = np.pad(freq, ((1, 0), (1, 0))).cumsum(axis=0).cumsum(axis=1)
+    sums = (integral[patch_size:, patch_size:]
+            - integral[:-patch_size, patch_size:]
+            - integral[patch_size:, :-patch_size]
+            + integral[:-patch_size, :-patch_size])
+    flat = sums.ravel()
+    k = min(len(flat), count * 4)
+    if k == 0:
+        return []
+    best = np.argpartition(flat, -k)[-k:]
+    best = best[np.argsort(flat[best])[::-1]]
+    rows, cols = np.unravel_index(best, sums.shape)
+    occupied = np.zeros((height, width), dtype=bool)
+    selected = []
+    for row, col in zip(rows, cols):
+        row, col = int(row), int(col)
+        if occupied[row:row + patch_size, col:col + patch_size].any():
+            continue
+        occupied[row:row + patch_size, col:col + patch_size] = True
+        selected.append((row, col))
+        if len(selected) >= count:
+            break
+    return selected
+
+
 def mutate_map(parent: Task, feedback: dict, rng: random.Random,
                patch_size: int) -> tuple[Task, str] | None:
-    """Noise, cellular-automata, or DLA patches near heavily used cells."""
-    if patch_size > min(parent.height, parent.width):
-        raise ValueError("--patch-size exceeds the resized map dimensions")
-    hot = [tuple(cell) for cell in feedback.get("hot_cells", [])]
-    if not hot:
-        hot = [(rng.randrange(parent.height), rng.randrange(parent.width))]
-    windows: list[tuple[int, int]] = []
-    for row, col in hot:
-        top = max(0, min(parent.height - patch_size, row - patch_size // 2))
-        left = max(0, min(parent.width - patch_size, col - patch_size // 2))
-        if all(abs(top - r) >= patch_size or abs(left - c) >= patch_size
-               for r, c in windows):
-            windows.append((top, left))
-        if len(windows) == 3:
-            break
+    """Noise, CA, or DLA patches in up to three high-waiting windows."""
+    windows = critical_windows(feedback, parent.height, parent.width, patch_size)
     current = parent
     selected_kinds: list[str] = []
     operations = ("replace", "union", "intersection", "new_minus_old",
                   "old_minus_new", "not_old_union_new", "old_union_not_new")
     weights = (4, 1, 0.3, 0.3, 0.3, 1, 1)
     for top, left in windows:
+        # The artifact retries on its previously mutated (possibly invalid)
+        # local map, committing only when the full task passes validation.
+        grid = [list(row) for row in current.grid]
         for _ in range(50):
             patch_kind = rng.choices(("uniform", "ca", "dla"), weights=(2, 2, 1), k=1)[0]
-            old_patch = tuple(row[left:left + patch_size]
-                              for row in current.grid[top:top + patch_size])
+            old_patch = tuple("".join(row[left:left + patch_size])
+                              for row in grid[top:top + patch_size])
             new_patch = generate_map_patch(old_patch, patch_kind, rng)
             operation = rng.choices(operations, weights=weights, k=1)[0]
-            grid = [list(row) for row in current.grid]
             for dr in range(patch_size):
                 for dc in range(patch_size):
                     old = grid[top + dr][left + dc] == "."
@@ -706,7 +756,7 @@ def mutate_map(parent: Task, feedback: dict, rng: random.Random,
                     }[operation]
                     grid[top + dr][left + dc] = "." if value else "@"
             candidate = Task(tuple("".join(row) for row in grid), current.agents)
-            if candidate != current and valid_task(candidate):
+            if valid_task(candidate):
                 current = candidate
                 selected_kinds.append(patch_kind)
                 break
@@ -716,76 +766,137 @@ def mutate_map(parent: Task, feedback: dict, rng: random.Random,
     return current, f"map_{kind_label}_patch_x{len(selected_kinds)}"
 
 
+CA_RULES = {
+    "Conway": ((3,), (2, 3)),
+    "HighLife": ((3, 6), (2, 3)),
+    "Day & Night": ((3, 6, 7, 8), (3, 4, 6, 7, 8)),
+    "Maze": ((3,), (1, 2, 3, 4, 5)),
+    "Mazectric": ((3,), (1, 2, 3, 4)),
+    "WalledCities": ((4, 5, 6, 7, 8), (2, 3, 4, 5)),
+    "Seed": ((2,), (-1,)),
+    "Diamoeba": ((3, 5, 6, 7, 8), (5, 6, 7, 8)),
+    "Cave": ((5, 6, 7, 8, 9), (5, 6, 7, 8, 9)),
+}
+
+# The artifact samples uniformly from all 26 CA strategies. Perlin is active
+# here even though the separate random_patch Perlin branch is unreachable.
+CA_PRESET_CONFIGS = (
+    (4, "Perlin", .3, "WalledCities"),
+    (4, "normal", .1, "WalledCities"),
+    (2, "normal", .6, "Conway"),
+    (1, "Perlin", .6, "Conway"),
+    (1, "Perlin", .4, "HighLife"),
+    (4, "Perlin", .4, "HighLife"),
+    (1, "normal", .05, "HighLife"),
+    (2, "normal", .05, "HighLife"),
+    (3, "normal", .05, "HighLife"),
+    (4, "normal", .05, "HighLife"),
+    (2, "normal", .2, "Day & Night"),
+    (4, "normal", .2, "Day & Night"),
+    (2, "Perlin", .3, "Day & Night"),
+    (4, "Perlin", .3, "Day & Night"),
+    (2, "normal", .35, "Maze"),
+    (4, "normal", .35, "Maze"),
+    (2, "Perlin", .35, "Maze"),
+    (4, "Perlin", .35, "Maze"),
+    (1, "normal", .4, "Mazectric"),
+    (2, "normal", .4, "Mazectric"),
+    (2, "normal", .15, "WalledCities"),
+    (2, "normal", .4, "Diamoeba"),
+    (2, "normal", .3, "Diamoeba"),
+    (2, "normal", .4, "Cave"),
+    (4, "normal", .4, "Cave"),
+    (2, "normal", .3, "Cave"),
+)
+
+
+def cellular_automata_patch(border: tuple[str, ...], rng: random.Random,
+                            preset: tuple[int, str, float, str]) -> tuple[str, ...]:
+    """Author's CA update: count free Moore neighbors, then restore the border."""
+    height, width = len(border), len(border[0])
+    iterations, noise_type, density, rule_name = preset
+    births, survives = CA_RULES[rule_name]
+    if noise_type == "Perlin":
+        try:
+            from noise import pnoise2
+        except ImportError as exc:
+            raise RuntimeError("Perlin CA needs noise==1.2.2") from exc
+        scale = height / float(rng.randint(1, 10))
+        x_offset, y_offset = rng.uniform(0, 1000), rng.uniform(0, 1000)
+        values = [[pnoise2((r + x_offset) / scale, (c + y_offset) / scale,
+                           octaves=4, persistence=.5, lacunarity=2.0)
+                   for c in range(width)] for r in range(height)]
+        threshold = sorted(value for row in values for value in row)[
+            int(density * height * width)]
+        cells = [[int(value >= threshold) for value in row] for row in values]
+    else:
+        cells = [[int(rng.random() > density) for _ in range(width)]
+                 for _ in range(height)]
+    for r in range(height):
+        cells[r][0], cells[r][-1] = int(border[r][0] == "."), int(border[r][-1] == ".")
+    for c in range(width):
+        cells[0][c], cells[-1][c] = int(border[0][c] == "."), int(border[-1][c] == ".")
+    for _ in range(iterations):
+        updated = [row[:] for row in cells]
+        for r in range(height):
+            for c in range(width):
+                free_neighbors = sum(cells[nr][nc]
+                                     for nr in range(max(0, r - 1), min(height, r + 2))
+                                     for nc in range(max(0, c - 1), min(width, c + 2))
+                                     if (nr, nc) != (r, c))
+                if cells[r][c] == 1 and free_neighbors in births:
+                    updated[r][c] = 0
+                elif cells[r][c] == 0 and free_neighbors not in survives:
+                    updated[r][c] = 1
+        cells = updated
+    for r in range(height):
+        cells[r][0], cells[r][-1] = int(border[r][0] == "."), int(border[r][-1] == ".")
+    for c in range(width):
+        cells[0][c], cells[-1][c] = int(border[0][c] == "."), int(border[-1][c] == ".")
+    return tuple("".join("." if value else "@" for value in row) for row in cells)
+
+
 def generate_map_patch(border: tuple[str, ...], kind: str,
                        rng: random.Random) -> tuple[str, ...]:
-    """Generate one binary patch; preserve its border from the source map."""
+    """Generate the artifact's random, CA, or DLA local patch."""
     height, width = len(border), len(border[0])
     if kind == "uniform":
         density = rng.uniform(0.1, 0.3)
-        cells = [["@" if rng.random() < density else "." for _ in range(width)]
-                 for _ in range(height)]
-    elif kind == "ca":
-        presets = (
-            ((3,), (2, 3)),       # Conway
-            ((3, 6), (2, 3)),     # HighLife
-            ((3,), (1, 2, 3, 4, 5)),  # Maze
-            ((4, 5, 6, 7, 8), (2, 3, 4, 5)),  # Walled Cities
-        )
-        births, survives = rng.choice(presets)
-        cells = [[rng.random() < 0.3 for _ in range(width)] for _ in range(height)]
-        cells = [["@" if value else "." for value in row] for row in cells]
-        for _ in range(rng.choice((2, 4))):
-            updated = [row[:] for row in cells]
-            for r in range(1, height - 1):
-                for c in range(1, width - 1):
-                    count = sum(cells[nr][nc] == "@"
-                                for nr in range(max(0, r - 1), min(height, r + 2))
-                                for nc in range(max(0, c - 1), min(width, c + 2))
-                                if (nr, nc) != (r, c))
-                    if cells[r][c] == "@":
-                        updated[r][c] = "@" if count in survives else "."
-                    else:
-                        updated[r][c] = "@" if count in births else "."
-            cells = updated
-    elif kind == "dla":
-        cells = [["." for _ in range(width)] for _ in range(height)]
-        for r in range(height):
-            cells[r][0], cells[r][-1] = border[r][0], border[r][-1]
-        for c in range(width):
-            cells[0][c], cells[-1][c] = border[0][c], border[-1][c]
-        obstacle_count = sum(row.count("@") for row in cells)
-        if height > 2 and width > 2:
-            seed = (rng.randrange(1, height - 1), rng.randrange(1, width - 1))
-            cells[seed[0]][seed[1]] = "@"
-            obstacle_count += 1
-            target = 0.3 * height * width
-            walker_limit = int(target * 5)
-            for _ in range(walker_limit):
-                if obstacle_count >= target:
-                    break
-                r, c = rng.randrange(1, height - 1), rng.randrange(1, width - 1)
-                if cells[r][c] == "@":
-                    continue
-                # Artifact-style random interior walk; cap steps to avoid stalls.
-                for _ in range(height * width * 20):
-                    dr, dc = rng.choice(((1, 0), (-1, 0), (0, 1), (0, -1)))
-                    nr, nc = r + dr, c + dc
-                    if not (0 < nr < height - 1 and 0 < nc < width - 1):
-                        break
-                    r, c = nr, nc
-                    if any(cells[ar][ac] == "@"
-                           for ar, ac in ((r-1,c),(r+1,c),(r,c-1),(r,c+1))):
-                        cells[r][c] = "@"
-                        obstacle_count += 1
-                        break
-    else:
+        # The author's random_patch does not copy the source border.
+        return tuple("".join("@" if rng.random() < density else "."
+                             for _ in range(width)) for _ in range(height))
+    if kind == "ca":
+        return cellular_automata_patch(border, rng, rng.choice(CA_PRESET_CONFIGS))
+    if kind != "dla":
         raise ValueError(f"Unknown map patch kind: {kind}")
-
-    # Keep the original patch boundary to reduce abrupt joins.
-    for c in range(width):
-        cells[0][c], cells[-1][c] = border[0][c], border[-1][c]
+    cells = [["." for _ in range(width)] for _ in range(height)]
     for r in range(height):
         cells[r][0], cells[r][-1] = border[r][0], border[r][-1]
+    for c in range(width):
+        cells[0][c], cells[-1][c] = border[0][c], border[-1][c]
+    obstacle_count = sum(row.count("@") for row in cells)
+    if height > 2 and width > 2:
+        r, c = rng.randrange(1, height - 1), rng.randrange(1, width - 1)
+        if cells[r][c] == ".":
+            cells[r][c] = "@"
+            obstacle_count += 1
+        target = 0.3 * height * width
+        remaining_walkers = target * 5
+        while obstacle_count < target and remaining_walkers > 0:
+            remaining_walkers -= 1
+            r, c = rng.randrange(1, height - 1), rng.randrange(1, width - 1)
+            if cells[r][c] == "@":
+                continue
+            while True:
+                dr, dc = rng.choice(((-1, 0), (1, 0), (0, -1), (0, 1)))
+                r, c = r + dr, c + dc
+                if not (0 < r < height - 1 and 0 < c < width - 1):
+                    break
+                if any(cells[ar][ac] == "@" for ar, ac in
+                       ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1))):
+                    cells[r][c] = "@"
+                    obstacle_count += 1
+                    break
     return tuple("".join(row) for row in cells)
 
 
@@ -1213,13 +1324,22 @@ def run(args: argparse.Namespace) -> Path:
         raise FileExistsError(f"Output already has a run; choose another directory: {out}")
     solver_binary = ((LACAM if args.solver == "lacam3" else PIBT) / "build" /
                      ("main" if args.solver == "lacam3" else "mapf"))
-    source_files = (Path(__file__), Path(__file__).with_name("checkpoint.py"))
+    source_files = (Path(__file__), Path(__file__).with_name("checkpoint.py"),
+                    Path(__file__).with_name("requirements-server.txt"))
+    def package_version(name: str) -> str | None:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            return None
     manifest = {"solver": args.solver, "map": str(map_paths[0].resolve()) if len(maps) == 1 else None,
                 "maps": [path for path, _ in maps],
                 "map_sha256": {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
                                for path in map_paths},
                 "source_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                                   for path in source_files},
+                "python_version": sys.version.split()[0],
+                "runtime_packages": {name: package_version(name)
+                                     for name in ("annoy", "noise", "numpy")},
                 "solver_sha256": (hashlib.sha256(solver_binary.read_bytes()).hexdigest()
                                   if solver_binary.is_file() else None),
                 "size": args.size, "agents": args.agents, "seed": args.seed,
@@ -1316,11 +1436,22 @@ def run(args: argparse.Namespace) -> Path:
                 mr_violations[divergent_mr] += 1
         p_score = mr_weight_decay ** max(0, mr_violations[divergent_mr] - mr_quota) \
             if divergent_mr else 1.0
+        # Eligibility does not depend on novelty weight, so the ANN tree may
+        # rebuild before applying its updated thresholds to this same task.
+        pool_eligible = (original["status"] == "solved" and not cf and not invalid_result
+                         and (is_initial_seed or not of))
+        feature_index_eligible = (original["status"] == "solved" and not invalid_result
+                                  and (pool_eligible if is_initial_seed else True))
         neighbor_distances = novelty_index.query(feature) \
             if feature is not None and not invalid_result else None
         distance = neighbor_distances[0] if neighbor_distances else None
-        second_distance = neighbor_distances[1] if neighbor_distances else None
-        s_score = diversity_weight(distance, second_neighbor_history, presorted=True)
+        second_distance = (neighbor_distances[1] if neighbor_distances
+                           and novelty_search == "exact" else None)
+        if feature is not None and feature_index_eligible:
+            novelty_index.add(feature)
+        s_score = (novelty_index.novelty_weight(distance)
+                   if novelty_search == "annoy" else
+                   diversity_weight(distance, second_neighbor_history, presorted=True))
         deviations = []
         base_soc = original.get("reported_soc")
         if original["status"] == "solved" and base_soc:
@@ -1334,8 +1465,6 @@ def run(args: argparse.Namespace) -> Path:
         # The artifact's initial pool keeps solved OF cases but excludes
         # CF/invalid cases. Later mutated cases are accepted only if they
         # pass the failure checks.
-        pool_eligible = (original["status"] == "solved" and not cf and not invalid_result
-                         and (is_initial_seed or not of))
         if parent_case is None:
             # The artifact doubles the base task fitness for initial seeds.
             energy = 0.4 * c_score if original["status"] == "solved" else 0.0
@@ -1346,10 +1475,6 @@ def run(args: argparse.Namespace) -> Path:
             energy = 0.0
         if second_distance is not None:
             bisect.insort(second_neighbor_history, second_distance)
-        feature_index_eligible = (original["status"] == "solved" and not invalid_result
-                                  and (pool_eligible if is_initial_seed else True))
-        if feature is not None and feature_index_eligible:
-            novelty_index.add(feature)
         if args.mode == "mutate" and pool_eligible:
             seed_pool.append({"case": case, "task": task, "feedback": original,
                               "energy": energy, "features": feature,
@@ -1394,7 +1519,7 @@ def run(args: argparse.Namespace) -> Path:
                "energy": energy, "violating_mr": divergent_mr,
                "mr_violation_counts": dict(mr_violations),
                "results": {name: {key: value for key, value in result.items()
-                                  if key != "_frames"}
+                                  if key not in ("_frames", "_waiting_freq")}
                            for name, result in results.items()}}
         return (row, keep_case_files, feature, feature_index_eligible,
                 pool_eligible, second_distance, original)

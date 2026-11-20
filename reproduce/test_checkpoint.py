@@ -280,7 +280,9 @@ class CheckpointChecks(unittest.TestCase):
             argv = ["run_server.py", "--resume-run", str(run_root), "--execute"]
             with patch.object(sys, "argv", argv), \
                  patch.object(run_server.importlib, "import_module",
-                              return_value=SimpleNamespace(AnnoyIndex=object)), \
+                              return_value=SimpleNamespace(
+                                  AnnoyIndex=object, ndarray=object,
+                                  pnoise2=lambda *_args: 0.0)), \
                  patch.object(run_server.subprocess, "run",
                               return_value=SimpleNamespace(returncode=0)) as call, \
                  redirect_stdout(io.StringIO()):

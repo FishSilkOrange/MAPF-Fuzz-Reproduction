@@ -19,7 +19,7 @@
 
 ## 安装与编译
 
-本机精确最近邻模式只用 Python 标准库；服务器 ANN 模式另需 Annoy。服务器还需要 Python 3.11、CMake、C++ 编译器和 Git；如需 Conda 环境：
+地图变异使用 NumPy 和 noise；服务器 ANN 模式另需 Annoy。这些固定版本均列在 `reproduce/requirements-server.txt`，本机与服务器运行前都应安装。服务器还需要 Python 3.11、CMake、C++ 编译器和 Git；如需 Conda 环境：
 
 ```bash
 conda env create --prefix .conda/envs/mapf-fuzz --file environment.yml
