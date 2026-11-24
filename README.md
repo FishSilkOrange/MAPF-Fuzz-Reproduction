@@ -22,7 +22,7 @@ The [paper](https://doi.org/10.1145/3744916.3787841) and [authors' implementatio
 
 The RQ1 worker count differs from the paper's 32-worker setup because of the available server budget. RQ1 counts are metamorphic **flags**, not independently diagnosed solver defects or proven optimality gaps. Probe agents add at least one SOC step each, so directly comparing raw probe SOC with the original SOC can inflate the paper-style disparity; the per-task output also records a probe-adjusted diagnostic. An OF example based only on order and mirror relations is available below. The RQ3 percentages use this implementation's phase boundaries and are an approximate comparison with the paper's timing figure.
 
-### English figures from the completed runs
+### figures from the completed runs
 
 | Question | Figure |
 | --- | --- |
